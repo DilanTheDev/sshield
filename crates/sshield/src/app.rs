@@ -1707,6 +1707,16 @@ impl App {
 
     // ------------------------------------------------------------- home
 
+    fn export_hosts(&mut self, kind: &str, text: String) {
+        let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| self.data_dir.clone());
+        let name = if kind == "json" { "sshield-hosts.json" } else { "sshield-ssh_config" };
+        let path = dir.join(name);
+        match std::fs::write(&path, text) {
+            Ok(_) => self.toast(format!("Exported {} hosts to {}", self.lib.hosts.len(), path.display())),
+            Err(e) => self.toast(format!("Export failed: {e}")),
+        }
+    }
+
     fn home(&mut self, ui: &mut egui::Ui) {
         let mut actions: Vec<Action> = vec![];
         ui.horizontal(|ui| {
@@ -1734,6 +1744,22 @@ impl App {
                 h.group = String::new();
                 self.editor = Some(HostEditor::new(h, true));
             }
+            ui.menu_button("⬇ Export hosts", |ui| {
+                ui.small("Passwords and passphrases are never exported.");
+                if ui.button("JSON (re-importable backup)").clicked() {
+                    self.export_hosts("json", export::hosts_json(&self.lib));
+                    ui.close();
+                }
+                if ui.button("OpenSSH config").clicked() {
+                    self.export_hosts("ssh_config", export::ssh_config(&self.lib));
+                    ui.close();
+                }
+                if ui.button("Copy JSON to clipboard").clicked() {
+                    ui.ctx().copy_text(export::hosts_json(&self.lib));
+                    self.toast("Hosts copied to clipboard");
+                    ui.close();
+                }
+            });
             if ui.button("Import ~/.ssh/config").clicked() {
                 let imported = sshconfig::import_default();
                 let existing: Vec<String> = self
