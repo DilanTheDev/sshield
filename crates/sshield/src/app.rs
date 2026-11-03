@@ -64,6 +64,7 @@ enum UiMsg {
     Update(Result<Option<crate::update::Release>, String>, bool),
     Sync(SyncMsg),
     ScheduleDone(Id, u64, String),
+    AgentDone(Result<String, String>),
     /// Installer launched (Ok) or failed.
     InstallStarted(Result<(), String>),
 }
@@ -327,6 +328,12 @@ pub struct App {
     settings_tab: SettingsTab,
     show_snippets: bool,
     show_schedules: bool,
+    show_agent: bool,
+    agent_kind: u8,
+    agent_prompt: String,
+    agent_ctx: bool,
+    agent_out: String,
+    agent_busy: bool,
     sched_running: Vec<Id>,
     sched_name: String,
     sched_host: usize,
@@ -407,6 +414,12 @@ impl App {
             settings_tab: SettingsTab::General,
             show_snippets: false,
             show_schedules: false,
+            show_agent: false,
+            agent_kind: 0,
+            agent_prompt: String::new(),
+            agent_ctx: true,
+            agent_out: String::new(),
+            agent_busy: false,
             sched_running: vec![],
             sched_name: String::new(),
             sched_host: 0,
@@ -1011,6 +1024,10 @@ impl App {
                 }
                 UiMsg::Session { tab, res } => self.on_session(tab, res),
                 UiMsg::Sync(m) => self.on_sync(m),
+                UiMsg::AgentDone(r) => {
+                    self.agent_busy = false;
+                    self.agent_out = r.unwrap_or_else(|e| format!("⚠ {e}"));
+                }
                 UiMsg::ScheduleDone(id, at, result) => {
                     self.sched_running.retain(|x| *x != id);
                     self.mutate(|l| {
@@ -1450,6 +1467,13 @@ impl App {
                         if ui.button("⚙").on_hover_text("Settings").clicked() {
                             self.show_settings = !self.show_settings;
                         }
+                        if ui
+                            .button("🤖 Agent")
+                            .on_hover_text("Chat with your local Claude Code / Codex CLI")
+                            .clicked()
+                        {
+                            self.show_agent = !self.show_agent;
+                        }
                         if ui.button("⏰ Schedules").clicked() {
                             self.show_schedules = !self.show_schedules;
                         }
@@ -1818,6 +1842,75 @@ impl App {
         self.ctx.request_repaint_after(Duration::from_secs(15));
     }
 
+    /// Text currently on the active terminal's screen (for agent context).
+    fn active_screen_text(&self) -> Option<String> {
+        match self.tabs.get(self.active).map(|t| &t.kind) {
+            Some(TabKind::Term(tt)) => Some(tt.term.parser.screen().contents()),
+            _ => None,
+        }
+    }
+
+    fn agent_window(&mut self, ctx: &egui::Context) {
+        if !self.show_agent {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("🤖 Agent").open(&mut open).default_size([520.0, 480.0]).show(ctx, |ui| {
+            ui.small("Runs your locally installed CLI using your own subscription login (run `claude` or `codex` once in a normal terminal to sign in). Nothing is sent anywhere by sshield itself.");
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("agent_kind").selected_text(["Claude Code", "Codex"][self.agent_kind as usize]).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.agent_kind, 0, "Claude Code (claude -p)");
+                    ui.selectable_value(&mut self.agent_kind, 1, "Codex (codex exec)");
+                });
+                ui.checkbox(&mut self.agent_ctx, "Include the active terminal screen");
+            });
+            ui.add(egui::TextEdit::multiline(&mut self.agent_prompt).hint_text("Ask about the output, an error, or a command…").desired_rows(3).desired_width(f32::INFINITY));
+            ui.horizontal(|ui| {
+                let can = !self.agent_busy && !self.agent_prompt.trim().is_empty();
+                if ui.add_enabled(can, egui::Button::new("Ask")).clicked() {
+                    let mut prompt = String::new();
+                    if self.agent_ctx {
+                        if let Some(t) = self.active_screen_text() {
+                            prompt.push_str("Terminal screen:\n```\n");
+                            prompt.push_str(t.trim_end());
+                            prompt.push_str("\n```\n\n");
+                        }
+                    }
+                    prompt.push_str("Answer concisely. Put any shell command in a fenced code block; do not run anything yourself.\n\n");
+                    prompt.push_str(self.agent_prompt.trim());
+                    self.agent_busy = true;
+                    self.agent_out.clear();
+                    let (tx, ctx2, kind) = (self.tx.clone(), self.ctx.clone(), self.agent_kind);
+                    self.rt.spawn_blocking(move || {
+                        let _ = tx.send(UiMsg::AgentDone(run_agent(kind, &prompt)));
+                        ctx2.request_repaint();
+                    });
+                }
+                if self.agent_busy {
+                    ui.spinner();
+                    ui.label("thinking…");
+                }
+            });
+            ui.separator();
+            if let Some(cmd) = first_code_block(&self.agent_out) {
+                ui.horizontal(|ui| {
+                    if ui.button("⏎ Insert command into terminal (not run)").on_hover_text("Types the command at the prompt; you press Enter yourself").clicked() {
+                        self.send_to_active(cmd.as_bytes());
+                    }
+                    if ui.button("Copy").clicked() {
+                        ctx.copy_text(cmd.clone());
+                    }
+                });
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add(egui::Label::new(&self.agent_out).selectable(true));
+            });
+        });
+        if !open {
+            self.show_agent = false;
+        }
+    }
+
     fn schedules_window(&mut self, ctx: &egui::Context) {
         if !self.show_schedules {
             return;
@@ -2101,6 +2194,7 @@ impl App {
         self.snippets_window(ctx);
         self.palette_window(ctx);
         self.schedules_window(ctx);
+        self.agent_window(ctx);
         self.settings_window(ctx);
         if let Some(id) = self.confirm_delete.clone() {
             let name = self
@@ -3259,6 +3353,61 @@ fn host_grid(
         });
 }
 
+/// Run the local agent CLI non-interactively; the prompt goes via stdin.
+fn run_agent(kind: u8, prompt: &str) -> Result<String, String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let (bin, args): (&str, &[&str]) = if kind == 0 {
+        ("claude", &["-p"])
+    } else {
+        ("codex", &["exec", "-"])
+    };
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", bin]);
+        c
+    } else {
+        Command::new(bin)
+    };
+    let mut child = cmd
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start `{bin}` ({e}). Install it and sign in first."))?;
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(prompt.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() && !text.is_empty() {
+        Ok(text)
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(format!(
+            "`{bin}` failed: {}{}",
+            err.trim(),
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("\n{text}")
+            }
+        ))
+    }
+}
+
+/// Body of the first ``` fenced block, if any.
+fn first_code_block(text: &str) -> Option<String> {
+    let start = text.find("```")?;
+    let rest = &text[start + 3..];
+    let nl = rest.find('\n')?;
+    let body = &rest[nl + 1..];
+    let end = body.find("```")?;
+    let code = body[..end].trim_end();
+    (!code.is_empty()).then(|| code.to_string())
+}
+
 fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     if s >= 3600 {
@@ -3277,6 +3426,15 @@ fn fuzzy(needle: &str, hay: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_code_block() {
+        assert_eq!(
+            first_code_block("run:\n```bash\nls -la\n```\nok").as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(first_code_block("no code"), None);
+    }
 
     #[test]
     fn fuzzy_matching() {
