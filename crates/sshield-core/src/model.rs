@@ -173,6 +173,8 @@ pub struct Settings {
     pub font_family: String,
     pub scrollback: usize,
     pub copy_on_select: bool,
+    /// In full-screen apps (tmux, less, vim) the wheel sends arrow keys. Off by default.
+    pub wheel_sends_arrows: bool,
     pub cursor_blink: bool,
     pub log_sessions: bool,
     pub log_dir: String,
@@ -196,6 +198,7 @@ impl Default for Settings {
             font_family: String::new(),
             scrollback: 10_000,
             copy_on_select: true,
+            wheel_sends_arrows: false,
                     cursor_blink: true,
             log_sessions: false,
             log_dir: String::new(),

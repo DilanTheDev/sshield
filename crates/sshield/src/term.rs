@@ -11,7 +11,13 @@ fn nz(v: u16) -> NonZeroU16 {
 
 impl Default for TermOutput {
     fn default() -> Self {
-        TermOutput { input: vec![], resize: None, submitted: None, clicked: false, zoom: 1.0 }
+        TermOutput {
+            input: vec![],
+            resize: None,
+            submitted: None,
+            clicked: false,
+            zoom: 1.0,
+        }
     }
 }
 
@@ -66,13 +72,22 @@ impl TermView {
     fn selection_text(&self) -> Option<String> {
         let (a, b) = self.sel?;
         let (s, e) = if a <= b { (a, b) } else { (b, a) };
-        let t = self.parser.screen().contents_between(s.0, s.1, e.0, e.1 + 1);
+        let t = self
+            .parser
+            .screen()
+            .contents_between(s.0, s.1, e.0, e.1 + 1);
         let t = t.trim_end().to_string();
         (!t.is_empty()).then_some(t)
     }
 
     /// Draw the terminal into the available space and translate input.
-    pub fn show(&mut self, ui: &mut egui::Ui, theme: &Theme, st: &Settings, focused_tab: bool) -> TermOutput {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        st: &Settings,
+        focused_tab: bool,
+    ) -> TermOutput {
         let mut out = TermOutput::default();
         let font = FontId::monospace(st.font_size);
         let (cw, ch) = ui.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
@@ -100,15 +115,24 @@ impl TermView {
             ui.memory_mut(|m| {
                 m.set_focus_lock_filter(
                     resp.id,
-                    egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true },
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
                 )
             });
         }
 
         // ---- mouse selection
         let cell_at = |p: Pos2| -> (u16, u16) {
-            let x = ((p.x - inner.left()) / cw).floor().clamp(0.0, (cols - 1) as f32) as u16;
-            let y = ((p.y - inner.top()) / ch).floor().clamp(0.0, (rows - 1) as f32) as u16;
+            let x = ((p.x - inner.left()) / cw)
+                .floor()
+                .clamp(0.0, (cols - 1) as f32) as u16;
+            let y = ((p.y - inner.top()) / ch)
+                .floor()
+                .clamp(0.0, (rows - 1) as f32) as u16;
             (y, x)
         };
         if let Some(p) = resp.interact_pointer_pos() {
@@ -155,7 +179,8 @@ impl TermView {
         // ---- Ctrl+scroll => zoom font; Ctrl+click => open link
         let mut link: Option<(u16, u16, u16, String)> = None;
         if resp.hovered() {
-            let (zd, ctrl, hover) = ui.input(|i| (i.zoom_delta(), i.modifiers.ctrl, i.pointer.hover_pos()));
+            let (zd, ctrl, hover) =
+                ui.input(|i| (i.zoom_delta(), i.modifiers.ctrl, i.pointer.hover_pos()));
             if (zd - 1.0).abs() > f32::EPSILON {
                 out.zoom = zd;
             }
@@ -185,14 +210,18 @@ impl TermView {
                 self.scroll_accum -= lines as f32;
                 let scr = self.parser.screen();
                 if scr.alternate_screen() {
-                    // alt-screen apps (less, man, vim): wheel => arrow keys
-                    let key: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
-                    for _ in 0..lines.unsigned_abs().min(10) * 3 {
-                        out.input.extend_from_slice(key);
+                    // optional: alt-screen apps (less, man, vim): wheel => arrow keys
+                    if st.wheel_sends_arrows {
+                        let key: &[u8] = if lines > 0 { b"\x1b[A" } else { b"\x1b[B" };
+                        for _ in 0..lines.unsigned_abs().min(10) * 3 {
+                            out.input.extend_from_slice(key);
+                        }
                     }
                 } else {
                     let cur = scr.scrollback() as i32;
-                    self.parser.screen_mut().set_scrollback((cur + lines * 3).max(0) as usize);
+                    self.parser
+                        .screen_mut()
+                        .set_scrollback((cur + lines * 3).max(0) as usize);
                 }
             }
         }
@@ -211,14 +240,22 @@ impl TermView {
         let screen = self.parser.screen();
         let (def_fg, def_bg) = (c(theme.fg), c(theme.bg));
         let sel = self.sel.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
-        let in_sel = |r: u16, col: u16| sel.map(|(s, e)| (r, col) >= s && (r, col) <= e).unwrap_or(false);
+        let in_sel = |r: u16, col: u16| {
+            sel.map(|(s, e)| (r, col) >= s && (r, col) <= e)
+                .unwrap_or(false)
+        };
 
         for r in 0..rows {
             let y = inner.top() + r as f32 * ch;
             // keyword highlight overrides
             let mut line_chars: Vec<char> = Vec::with_capacity(cols as usize);
             for col in 0..cols {
-                line_chars.push(screen.cell(r, col).and_then(|x| x.contents().chars().next()).unwrap_or(' '));
+                line_chars.push(
+                    screen
+                        .cell(r, col)
+                        .and_then(|x| x.contents().chars().next())
+                        .unwrap_or(' '),
+                );
             }
             let mut hl: Vec<Option<Color32>> = vec![None; cols as usize];
             if !st.highlights.is_empty() {
@@ -250,16 +287,27 @@ impl TermView {
                     return;
                 }
                 let x = inner.left() + start as f32 * cw;
-                painter.text(Pos2::new(x, y), Align2::LEFT_TOP, run.as_str(), font.clone(), fg);
+                painter.text(
+                    Pos2::new(x, y),
+                    Align2::LEFT_TOP,
+                    run.as_str(),
+                    font.clone(),
+                    fg,
+                );
                 if ul {
                     let w = run.chars().count() as f32 * cw;
-                    painter.line_segment([Pos2::new(x, y + ch - 1.5), Pos2::new(x + w, y + ch - 1.5)], Stroke::new(1.0, fg));
+                    painter.line_segment(
+                        [Pos2::new(x, y + ch - 1.5), Pos2::new(x + w, y + ch - 1.5)],
+                        Stroke::new(1.0, fg),
+                    );
                 }
                 run.clear();
             };
 
             for col in 0..cols {
-                let Some(cell) = screen.cell(r, col) else { continue };
+                let Some(cell) = screen.cell(r, col) else {
+                    continue;
+                };
                 if cell.is_wide_continuation() {
                     continue;
                 }
@@ -296,7 +344,11 @@ impl TermView {
                 let width = if cell.is_wide() { 2.0 } else { 1.0 };
                 if let Some(bg) = bg {
                     let x = inner.left() + col as f32 * cw;
-                    painter.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(cw * width, ch + 0.5)), 0.0, bg);
+                    painter.rect_filled(
+                        Rect::from_min_size(Pos2::new(x, y), Vec2::new(cw * width, ch + 0.5)),
+                        0.0,
+                        bg,
+                    );
                 }
                 let txt = cell.contents();
                 if txt.is_empty() || txt == " " {
@@ -327,13 +379,18 @@ impl TermView {
             let y = inner.top() + (*r as f32 + 1.0) * ch - 1.0;
             let x0 = inner.left() + *a as f32 * cw;
             let x1 = inner.left() + (*b as f32 + 1.0) * cw;
-            painter.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.5, c(theme.ansi[4])));
+            painter.line_segment(
+                [Pos2::new(x0, y), Pos2::new(x1, y)],
+                Stroke::new(1.5, c(theme.ansi[4])),
+            );
         }
 
         // cursor
         if screen.scrollback() == 0 && !screen.hide_cursor() {
             let (cr, cc) = screen.cursor_position();
-            let blink_on = !st.cursor_blink || (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0 || !resp.has_focus();
+            let blink_on = !st.cursor_blink
+                || (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0
+                || !resp.has_focus();
             let x = inner.left() + cc as f32 * cw;
             let y = inner.top() + cr as f32 * ch;
             let r = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cw, ch));
@@ -343,24 +400,49 @@ impl TermView {
                     if let Some(cell) = screen.cell(cr, cc) {
                         let t = cell.contents();
                         if !t.is_empty() {
-                            painter.text(Pos2::new(x, y), Align2::LEFT_TOP, t, font.clone(), c(theme.bg));
+                            painter.text(
+                                Pos2::new(x, y),
+                                Align2::LEFT_TOP,
+                                t,
+                                font.clone(),
+                                c(theme.bg),
+                            );
                         }
                     }
                 }
                 if st.cursor_blink {
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(500));
                 }
             } else {
-                painter.rect_stroke(r, 1.0, Stroke::new(1.0, c(theme.cursor)), egui::StrokeKind::Inside);
+                painter.rect_stroke(
+                    r,
+                    1.0,
+                    Stroke::new(1.0, c(theme.cursor)),
+                    egui::StrokeKind::Inside,
+                );
             }
             // autocomplete ghost text
             if let Some(s) = &self.suggestion {
-                painter.text(Pos2::new(x, y), Align2::LEFT_TOP, s, font.clone(), c(theme.fg).gamma_multiply(0.38));
+                painter.text(
+                    Pos2::new(x, y),
+                    Align2::LEFT_TOP,
+                    s,
+                    font.clone(),
+                    c(theme.fg).gamma_multiply(0.38),
+                );
             }
         }
         if screen.scrollback() > 0 {
-            let g = painter.layout_no_wrap(format!(" scrollback -{} ", screen.scrollback()), FontId::proportional(12.0), c(theme.bg));
-            let r = Rect::from_min_size(rect.right_top() + Vec2::new(-8.0 - g.size().x, 6.0), g.size());
+            let g = painter.layout_no_wrap(
+                format!(" scrollback -{} ", screen.scrollback()),
+                FontId::proportional(12.0),
+                c(theme.bg),
+            );
+            let r = Rect::from_min_size(
+                rect.right_top() + Vec2::new(-8.0 - g.size().x, 6.0),
+                g.size(),
+            );
             painter.rect_filled(r, 4.0, c(theme.cursor));
             painter.galley(r.min, g, c(theme.bg));
         }
@@ -371,7 +453,11 @@ impl TermView {
     fn url_at(&self, row: u16, col: u16) -> Option<(u16, u16, u16, String)> {
         let scr = self.parser.screen();
         let chars: Vec<char> = (0..self.cols)
-            .map(|cc| scr.cell(row, cc).and_then(|x| x.contents().chars().next()).unwrap_or(' '))
+            .map(|cc| {
+                scr.cell(row, cc)
+                    .and_then(|x| x.contents().chars().next())
+                    .unwrap_or(' ')
+            })
             .collect();
         let ws = |i: usize| chars[i].is_whitespace();
         let col = col as usize;
@@ -386,21 +472,38 @@ impl TermView {
             b += 1;
         }
         let tok: String = chars[a..=b].iter().collect();
-        let p = ["https://", "http://", "ftp://"].iter().filter_map(|pre| tok.find(pre)).min()?;
+        let p = ["https://", "http://", "ftp://"]
+            .iter()
+            .filter_map(|pre| tok.find(pre))
+            .min()?;
         let start = a + tok[..p].chars().count();
         let mut end = b;
-        while end > start && matches!(chars[end], '.' | ',' | ';' | ':' | ')' | ']' | '}' | '>' | '\'' | '"' | '!' | '?') {
+        while end > start
+            && matches!(
+                chars[end],
+                '.' | ',' | ';' | ':' | ')' | ']' | '}' | '>' | '\'' | '"' | '!' | '?'
+            )
+        {
             end -= 1;
         }
         if col < start || col > end {
             return None;
         }
-        Some((row, start as u16, end as u16, chars[start..=end].iter().collect()))
+        Some((
+            row,
+            start as u16,
+            end as u16,
+            chars[start..=end].iter().collect(),
+        ))
     }
 
     fn word_at(&self, row: u16, col: u16) -> ((u16, u16), (u16, u16)) {
         let scr = self.parser.screen();
-        let is_w = |cc: u16| scr.cell(row, cc).map(|x| !x.contents().is_empty() && !x.contents().chars().all(char::is_whitespace)).unwrap_or(false);
+        let is_w = |cc: u16| {
+            scr.cell(row, cc)
+                .map(|x| !x.contents().is_empty() && !x.contents().chars().all(char::is_whitespace))
+                .unwrap_or(false)
+        };
         if !is_w(col) {
             return ((row, col), (row, col));
         }
@@ -457,19 +560,38 @@ impl TermView {
             }
             Event::Cut => out.input.push(0x18),
             // Termius-style terminal shortcuts: Ctrl+Shift+C / Ctrl+Shift+V / Shift+Insert.
-            Event::Key { key: Key::C, pressed: true, modifiers, .. } if modifiers.ctrl && modifiers.shift => {
+            Event::Key {
+                key: Key::C,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.ctrl && modifiers.shift => {
                 if let Some(t) = self.selection_text() {
                     ctx.copy_text(t);
                 }
             }
-            Event::Key { key, pressed: true, modifiers, .. }
-                if (key == Key::V && modifiers.ctrl && modifiers.shift) || (key == Key::Insert && modifiers.shift && !modifiers.ctrl) =>
+            Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } if (key == Key::V && modifiers.ctrl && modifiers.shift)
+                || (key == Key::Insert && modifiers.shift && !modifiers.ctrl) =>
             {
-                if let Some(t) = arboard::Clipboard::new().and_then(|mut cb| cb.get_text()).ok().filter(|t| !t.is_empty()) {
+                if let Some(t) = arboard::Clipboard::new()
+                    .and_then(|mut cb| cb.get_text())
+                    .ok()
+                    .filter(|t| !t.is_empty())
+                {
                     self.handle_event(Event::Paste(t), out, ctx);
                 }
             }
-            Event::Key { key, pressed: true, modifiers, .. } => self.handle_key(key, modifiers, out),
+            Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => self.handle_key(key, modifiers, out),
             _ => {}
         }
     }
@@ -477,7 +599,11 @@ impl TermView {
     /// Update the ghost-text suggestion from history/snippets for the line being typed.
     pub fn update_suggestion(&mut self, lib: &sshield_core::Library) {
         self.suggestion = None;
-        if self.line_valid && !self.line.is_empty() && self.parser.screen().scrollback() == 0 && !self.parser.screen().alternate_screen() {
+        if self.line_valid
+            && !self.line.is_empty()
+            && self.parser.screen().scrollback() == 0
+            && !self.parser.screen().alternate_screen()
+        {
             if let Some(s) = lib.complete(&self.line, 1).first() {
                 self.suggestion = Some(s[self.line.len()..].to_string());
             }
@@ -504,7 +630,11 @@ impl TermView {
         };
         let tilde = |n: u8| -> Vec<u8> {
             let mods = 1 + (m.shift as u8) + 2 * (m.alt as u8) + 4 * (m.ctrl as u8);
-            if mods > 1 { format!("\x1b[{n};{mods}~").into_bytes() } else { format!("\x1b[{n}~").into_bytes() }
+            if mods > 1 {
+                format!("\x1b[{n};{mods}~").into_bytes()
+            } else {
+                format!("\x1b[{n}~").into_bytes()
+            }
         };
         let bytes: Vec<u8> = match key {
             Key::Enter => {
@@ -517,11 +647,19 @@ impl TermView {
             }
             Key::Backspace => {
                 self.track(b"\x7f", None);
-                if m.ctrl { vec![0x17] } else { vec![0x7f] }
+                if m.ctrl {
+                    vec![0x17]
+                } else {
+                    vec![0x7f]
+                }
             }
             Key::Tab => {
                 self.line_valid = false;
-                if m.shift { b"\x1b[Z".to_vec() } else { b"\t".to_vec() }
+                if m.shift {
+                    b"\x1b[Z".to_vec()
+                } else {
+                    b"\t".to_vec()
+                }
             }
             Key::Escape => b"\x1b".to_vec(),
             Key::ArrowUp => {
@@ -552,12 +690,16 @@ impl TermView {
             Key::End => csi('F'),
             Key::PageUp if m.shift => {
                 let cur = self.parser.screen().scrollback();
-                self.parser.screen_mut().set_scrollback(cur + self.rows as usize / 2);
+                self.parser
+                    .screen_mut()
+                    .set_scrollback(cur + self.rows as usize / 2);
                 return;
             }
             Key::PageDown if m.shift => {
                 let cur = self.parser.screen().scrollback();
-                self.parser.screen_mut().set_scrollback(cur.saturating_sub(self.rows as usize / 2));
+                self.parser
+                    .screen_mut()
+                    .set_scrollback(cur.saturating_sub(self.rows as usize / 2));
                 return;
             }
             Key::PageUp => tilde(5),
@@ -608,7 +750,11 @@ fn key_char(k: Key, shift: bool) -> Option<char> {
     if it.next().is_some() || !ch.is_ascii_alphanumeric() {
         return None;
     }
-    Some(if shift { ch.to_ascii_uppercase() } else { ch.to_ascii_lowercase() })
+    Some(if shift {
+        ch.to_ascii_uppercase()
+    } else {
+        ch.to_ascii_lowercase()
+    })
 }
 
 fn ctrl_char(k: Key) -> Option<u8> {
@@ -641,7 +787,10 @@ mod tests {
     fn feeds_and_selects_text() {
         let mut t = TermView::new(100);
         t.feed(b"hello world\r\nsecond line");
-        assert_eq!(t.parser.screen().contents().lines().next(), Some("hello world"));
+        assert_eq!(
+            t.parser.screen().contents().lines().next(),
+            Some("hello world")
+        );
         t.sel = Some(((0, 0), (0, 4)));
         assert_eq!(t.selection_text().as_deref(), Some("hello"));
         assert_eq!(t.word_at(0, 8), ((0, 6), (0, 10)));
@@ -661,7 +810,11 @@ mod tests {
     fn enter_submits_tracked_line() {
         let mut t = TermView::new(10);
         let mut out = TermOutput::default();
-        t.handle_event(egui::Event::Text("ls -la".into()), &mut out, &egui::Context::default());
+        t.handle_event(
+            egui::Event::Text("ls -la".into()),
+            &mut out,
+            &egui::Context::default(),
+        );
         t.handle_key(Key::Enter, Modifiers::NONE, &mut out);
         assert_eq!(out.submitted.as_deref(), Some("ls -la"));
         assert!(out.input.ends_with(b"\r"));
