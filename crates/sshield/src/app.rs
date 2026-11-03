@@ -4,7 +4,9 @@ use crate::theme::{self, c, Theme};
 use eframe::egui::{self, Align, Layout, RichText};
 use futures::future::BoxFuture;
 use sshield_core::forward::{self, ForwardHandle};
-use sshield_core::ssh::{self, Connection, Connector, HostKeyQuery, Interactor, ShellCmd, ShellEvent};
+use sshield_core::ssh::{
+    self, Connection, Connector, HostKeyQuery, Interactor, ShellCmd, ShellEvent,
+};
 use sshield_core::vault::{self, KdfCost, Vault};
 use sshield_core::vpn::{self, VpnManager};
 use sshield_core::*;
@@ -27,10 +29,21 @@ pub struct SessionReady {
 
 enum UiMsg {
     HostKey(HostKeyQuery, oneshot::Sender<bool>),
-    Secret { prompt: String, echo: bool, reply: oneshot::Sender<Option<String>> },
-    Session { tab: u64, res: Result<Box<SessionReady>, String> },
+    Secret {
+        prompt: String,
+        echo: bool,
+        reply: oneshot::Sender<Option<String>>,
+    },
+    Session {
+        tab: u64,
+        res: Result<Box<SessionReady>, String>,
+    },
     Unlocked(Result<(Vault, Library), String>),
     Toast(String),
+    /// Result of an update check; `manual` checks report "up to date".
+    Update(Result<Option<crate::update::Release>, String>, bool),
+    /// Installer launched (Ok) or failed.
+    InstallStarted(Result<(), String>),
 }
 
 struct UiInteractor {
@@ -47,7 +60,11 @@ impl Interactor for UiInteractor {
     }
     fn prompt(&self, prompt: String, echo: bool) -> BoxFuture<'static, Option<String>> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.tx.send(UiMsg::Secret { prompt, echo, reply });
+        let _ = self.tx.send(UiMsg::Secret {
+            prompt,
+            echo,
+            reply,
+        });
         self.ctx.request_repaint();
         Box::pin(async move { rx.await.ok().flatten() })
     }
@@ -55,7 +72,12 @@ impl Interactor for UiInteractor {
 
 enum Pending {
     HostKey(HostKeyQuery, Option<oneshot::Sender<bool>>),
-    Secret { prompt: String, echo: bool, value: String, reply: Option<oneshot::Sender<Option<String>>> },
+    Secret {
+        prompt: String,
+        echo: bool,
+        value: String,
+        reply: Option<oneshot::Sender<Option<String>>>,
+    },
 }
 
 // ----------------------------------------------------------------- tabs
@@ -125,10 +147,28 @@ struct HostEditor {
 impl HostEditor {
     fn new(host: Host, is_new: bool) -> Self {
         let (auth_kind, password, identity, keyfile, keypass) = match &host.auth {
-            Auth::Prompt => (0, String::new(), String::new(), String::new(), String::new()),
-            Auth::Password { password } => (1, password.clone(), String::new(), String::new(), String::new()),
+            Auth::Prompt => (
+                0,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+            Auth::Password { password } => (
+                1,
+                password.clone(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
             Auth::Identity { id } => (2, String::new(), id.clone(), String::new(), String::new()),
-            Auth::KeyFile { path, passphrase } => (3, String::new(), String::new(), path.clone(), passphrase.clone().unwrap_or_default()),
+            Auth::KeyFile { path, passphrase } => (
+                3,
+                String::new(),
+                String::new(),
+                path.clone(),
+                passphrase.clone().unwrap_or_default(),
+            ),
         };
         HostEditor {
             auth_kind,
@@ -138,7 +178,12 @@ impl HostEditor {
             keypass,
             tags: host.tags.join(", "),
             startup: host.startup.join("\n"),
-            env: host.env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n"),
+            env: host
+                .env
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
             vpn_choice: match host.require_vpn {
                 None => 0,
                 Some(true) => 1,
@@ -160,8 +205,12 @@ impl HostEditor {
             h.label = h.hostname.clone();
         }
         h.auth = match self.auth_kind {
-            1 => Auth::Password { password: self.password.clone() },
-            2 if !self.identity.is_empty() => Auth::Identity { id: self.identity.clone() },
+            1 => Auth::Password {
+                password: self.password.clone(),
+            },
+            2 if !self.identity.is_empty() => Auth::Identity {
+                id: self.identity.clone(),
+            },
             2 => return Err("Pick a key (create one in Settings → Keys)".into()),
             3 if !self.keyfile.trim().is_empty() => Auth::KeyFile {
                 path: self.keyfile.trim().into(),
@@ -170,8 +219,19 @@ impl HostEditor {
             3 => return Err("Key file path is required".into()),
             _ => Auth::Prompt,
         };
-        h.tags = self.tags.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        h.startup = self.startup.lines().map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+        h.tags = self
+            .tags
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        h.startup = self
+            .startup
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
         h.env = self
             .env
             .lines()
@@ -228,6 +288,8 @@ pub struct App {
     next_id: u64,
     pending: VecDeque<Pending>,
     toasts: Vec<(String, Instant)>,
+    update: Option<crate::update::Release>,
+    installing: bool,
     search: String,
     quick: String,
     editor: Option<HostEditor>,
@@ -251,7 +313,10 @@ pub struct App {
 }
 
 fn now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl App {
@@ -261,6 +326,8 @@ impl App {
         let lib = Library::default();
         let theme = theme::find(&lib.settings.theme);
         theme::apply_visuals(&cc.egui_ctx, &theme, lib.settings.accent, 1.0);
+        // Ctrl +/-/scroll zoom the terminal font, not the whole UI.
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         App {
             rt,
             ctx: cc.egui_ctx.clone(),
@@ -276,11 +343,17 @@ impl App {
             pw2: String::new(),
             lock_error: String::new(),
             theme,
-            tabs: vec![Tab { id: 0, title: "Hosts".into(), kind: TabKind::Home }],
+            tabs: vec![Tab {
+                id: 0,
+                title: "Hosts".into(),
+                kind: TabKind::Home,
+            }],
             active: 0,
             next_id: 1,
             pending: VecDeque::new(),
             toasts: vec![],
+            update: None,
+            installing: false,
             search: String::new(),
             quick: String::new(),
             editor: None,
@@ -325,16 +398,25 @@ impl App {
         }
         self.dirty = false;
         if let Some(v) = &mut self.vault {
-            v.set_mirror((!self.lib.settings.sync_dir.trim().is_empty()).then(|| PathBuf::from(self.lib.settings.sync_dir.trim())));
+            v.set_mirror(
+                (!self.lib.settings.sync_dir.trim().is_empty())
+                    .then(|| PathBuf::from(self.lib.settings.sync_dir.trim())),
+            );
             if let Err(e) = v.save(&self.lib) {
-                self.toasts.push((format!("Saving vault failed: {e}"), Instant::now()));
+                self.toasts
+                    .push((format!("Saving vault failed: {e}"), Instant::now()));
             }
         }
     }
 
     fn apply_theme(&mut self) {
         self.theme = theme::find(&self.lib.settings.theme);
-        theme::apply_visuals(&self.ctx, &self.theme, self.lib.settings.accent, self.lib.settings.ui_scale);
+        theme::apply_visuals(
+            &self.ctx,
+            &self.theme,
+            self.lib.settings.accent,
+            self.lib.settings.ui_scale,
+        );
         self.apply_font();
     }
 
@@ -359,15 +441,27 @@ impl App {
         );
         for p in candidates {
             if let Ok(bytes) = std::fs::read(&p) {
-                fonts.font_data.insert("user_mono".into(), Arc::new(egui::FontData::from_owned(bytes)));
-                fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "user_mono".into());
+                fonts.font_data.insert(
+                    "user_mono".into(),
+                    Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .insert(0, "user_mono".into());
                 break;
             }
         }
         // CJK / symbol fallbacks that ship with Windows, appended after the defaults
-        for (name, p) in [("win_yahei", r"C:\Windows\Fonts\msyh.ttc"), ("win_symbols", r"C:\Windows\Fonts\seguisym.ttf")] {
+        for (name, p) in [
+            ("win_yahei", r"C:\Windows\Fonts\msyh.ttc"),
+            ("win_symbols", r"C:\Windows\Fonts\seguisym.ttf"),
+        ] {
             if let Ok(bytes) = std::fs::read(p) {
-                fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
+                fonts
+                    .font_data
+                    .insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
                 for fam in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
                     fonts.families.entry(fam).or_default().push(name.into());
                 }
@@ -378,13 +472,43 @@ impl App {
 
     // ------------------------------------------------------------ vault
 
+    fn check_update(&self, manual: bool) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.rt.spawn_blocking(move || {
+            let _ = tx.send(UiMsg::Update(crate::update::check(), manual));
+            ctx.request_repaint();
+        });
+    }
+
+    fn install_update(&mut self) {
+        let Some(rel) = self.update.clone() else { return };
+        match rel.installer_url {
+            Some(url) if cfg!(windows) => {
+                self.installing = true;
+                let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+                self.rt.spawn_blocking(move || {
+                    let _ = tx.send(UiMsg::InstallStarted(crate::update::download_and_run(&url)));
+                    ctx.request_repaint();
+                });
+            }
+            _ => self.ctx.open_url(egui::OpenUrl::new_tab(crate::update::RELEASES_PAGE)),
+        }
+    }
+
     fn do_unlock(&mut self, create: bool) {
-        let (path, pw, tx, ctx) = (self.vault_path(), self.pw.clone(), self.tx.clone(), self.ctx.clone());
+        let (path, pw, tx, ctx) = (
+            self.vault_path(),
+            self.pw.clone(),
+            self.tx.clone(),
+            self.ctx.clone(),
+        );
         self.unlocking = true;
         self.lock_error.clear();
         self.rt.spawn_blocking(move || {
             let r = if create {
-                Vault::create(&path, &pw, &Library::default(), KdfCost::STRONG).map(|v| (v, Library::default())).map_err(|e| e.to_string())
+                Vault::create(&path, &pw, &Library::default(), KdfCost::STRONG)
+                    .map(|v| (v, Library::default()))
+                    .map_err(|e| e.to_string())
             } else {
                 Vault::unlock(&path, &pw).map_err(|e| e.to_string())
             };
@@ -442,7 +566,13 @@ impl App {
 
     fn open_sftp(&mut self, host: Host) {
         let title = format!("SFTP · {}", host.label);
-        let id = self.new_tab(title, TabKind::Sftp(Box::new(SftpEntry { host: host.clone(), state: SftpState::Connecting })));
+        let id = self.new_tab(
+            title,
+            TabKind::Sftp(Box::new(SftpEntry {
+                host: host.clone(),
+                state: SftpState::Connecting,
+            })),
+        );
         self.start_connect(id, host, false);
     }
 
@@ -461,13 +591,38 @@ impl App {
             Ok(c) => c,
             Err(e) => return self.fail_tab(tab_id, e),
         };
-        let interactor = Arc::new(UiInteractor { tx: self.tx.clone(), ctx: self.ctx.clone() });
-        let connector = match Connector::new(&self.lib, interactor, self.vpn.clone(), self.known_hosts(), &host) {
+        let interactor = Arc::new(UiInteractor {
+            tx: self.tx.clone(),
+            ctx: self.ctx.clone(),
+        });
+        let connector = match Connector::new(
+            &self.lib,
+            interactor,
+            self.vpn.clone(),
+            self.known_hosts(),
+            &host,
+        ) {
             Ok(c) => c,
             Err(e) => return self.fail_tab(tab_id, e.to_string()),
         };
-        if let Some(TabKind::Term(t)) = self.tabs.iter_mut().find(|t| t.id == tab_id).map(|t| &mut t.kind) {
-            t.via = if chain.is_empty() { String::new() } else { format!("via {}", chain.iter().map(|h| h.label.as_str()).collect::<Vec<_>>().join(" → ")) };
+        if let Some(TabKind::Term(t)) = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == tab_id)
+            .map(|t| &mut t.kind)
+        {
+            t.via = if chain.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "via {}",
+                    chain
+                        .iter()
+                        .map(|h| h.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" → ")
+                )
+            };
             if connector.vpn_policy.is_some() {
                 t.via.push_str(" · 🛡 VPN-pinned");
             }
@@ -477,21 +632,37 @@ impl App {
             .tabs
             .iter()
             .find(|t| t.id == tab_id)
-            .and_then(|t| if let TabKind::Term(t) = &t.kind { Some(t.term.size()) } else { None })
+            .and_then(|t| {
+                if let TabKind::Term(t) = &t.kind {
+                    Some(t.term.size())
+                } else {
+                    None
+                }
+            })
             .unwrap_or((120, 30));
         self.rt.spawn(async move {
             let res: Result<Box<SessionReady>, String> = async {
-                let conn = Arc::new(connector.connect(&host, &chain).await.map_err(|e| e.to_string())?);
+                let conn = Arc::new(
+                    connector
+                        .connect(&host, &chain)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                );
                 let mut warnings = vec![];
                 let mut forwards = vec![];
                 for f in &host.forwards {
                     match forward::start(conn.clone(), f.clone()).await {
                         Ok(h) => forwards.push(h),
-                        Err(e) => warnings.push(format!("forward {}:{} failed: {e}", f.bind_host, f.bind_port)),
+                        Err(e) => warnings.push(format!(
+                            "forward {}:{} failed: {e}",
+                            f.bind_host, f.bind_port
+                        )),
                     }
                 }
                 let shell = if want_shell {
-                    let mut sh = ssh::open_shell(&conn, &host, cols as u32, rows as u32).await.map_err(|e| e.to_string())?;
+                    let mut sh = ssh::open_shell(&conn, &host, cols as u32, rows as u32)
+                        .await
+                        .map_err(|e| e.to_string())?;
                     let (etx, erx) = channel::<ShellEvent>();
                     let ctx2 = ctx.clone();
                     tokio::spawn(async move {
@@ -508,7 +679,12 @@ impl App {
                 } else {
                     None
                 };
-                Ok(Box::new(SessionReady { conn, shell, forwards, warnings }))
+                Ok(Box::new(SessionReady {
+                    conn,
+                    shell,
+                    forwards,
+                    warnings,
+                }))
             }
             .await;
             let _ = tx.send(UiMsg::Session { tab: tab_id, res });
@@ -520,16 +696,40 @@ impl App {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 UiMsg::HostKey(q, r) => self.pending.push_back(Pending::HostKey(q, Some(r))),
-                UiMsg::Secret { prompt, echo, reply } => {
-                    self.pending.push_back(Pending::Secret { prompt, echo, value: String::new(), reply: Some(reply) })
-                }
+                UiMsg::Secret {
+                    prompt,
+                    echo,
+                    reply,
+                } => self.pending.push_back(Pending::Secret {
+                    prompt,
+                    echo,
+                    value: String::new(),
+                    reply: Some(reply),
+                }),
                 UiMsg::Toast(s) => self.toast(s),
+                UiMsg::Update(r, manual) => match r {
+                    Ok(Some(rel)) => self.update = Some(rel),
+                    Ok(None) if manual => self.toast("sshield is up to date"),
+                    Err(e) if manual => self.toast(format!("Update check failed: {e}")),
+                    _ => {}
+                },
+                UiMsg::InstallStarted(r) => match r {
+                    // the installer replaces our exe, so quit and let it relaunch us
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        self.installing = false;
+                        self.toast(format!("Update failed: {e}"));
+                    }
+                },
                 UiMsg::Unlocked(r) => {
                     self.unlocking = false;
                     match r {
                         Ok((v, lib)) => {
                             self.vault = Some(v);
                             self.lib = lib;
+                            if self.lib.settings.check_updates {
+                                self.check_update(false);
+                            }
                             self.pw.clear();
                             self.pw2.clear();
                             self.applied_font = "\u{0}".into();
@@ -545,9 +745,15 @@ impl App {
 
     fn on_session(&mut self, tab: u64, res: Result<Box<SessionReady>, String>) {
         let log_enabled = self.lib.settings.log_sessions;
-        let log_dir = if self.lib.settings.log_dir.trim().is_empty() { self.data_dir.join("logs") } else { PathBuf::from(self.lib.settings.log_dir.trim()) };
+        let log_dir = if self.lib.settings.log_dir.trim().is_empty() {
+            self.data_dir.join("logs")
+        } else {
+            PathBuf::from(self.lib.settings.log_dir.trim())
+        };
         let (handle, ctx) = (self.rt.clone(), self.ctx.clone());
-        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) else { return };
+        let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) else {
+            return;
+        };
         match (res, &mut t.kind) {
             (Err(e), TabKind::Term(tt)) => tt.state = TermState::Closed(e),
             (Err(e), TabKind::Sftp(s)) => s.state = SftpState::Failed(e),
@@ -564,8 +770,14 @@ impl App {
                 tt.state = TermState::Ready;
                 if log_enabled {
                     let _ = std::fs::create_dir_all(&log_dir);
-                    let name: String = tt.host.label.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
-                    tt.log = std::fs::File::create(log_dir.join(format!("{name}-{}.log", now()))).ok();
+                    let name: String = tt
+                        .host
+                        .label
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                        .collect();
+                    tt.log =
+                        std::fs::File::create(log_dir.join(format!("{name}-{}.log", now()))).ok();
                 }
             }
             (Ok(r), TabKind::Sftp(s)) => {
@@ -632,7 +844,10 @@ impl App {
     }
 
     fn maybe_stop_vpn(&self) {
-        let any = self.tabs.iter().any(|t| matches!(&t.kind, TabKind::Term(tt) if tt.conn.is_some()));
+        let any = self
+            .tabs
+            .iter()
+            .any(|t| matches!(&t.kind, TabKind::Term(tt) if tt.conn.is_some()));
         if !any && self.lib.settings.vpn.auto_stop {
             let v = self.vpn.clone();
             self.rt.spawn(async move { v.stop().await });
@@ -640,7 +855,11 @@ impl App {
     }
 
     fn send_to_active(&mut self, bytes: &[u8]) {
-        if let Some(Tab { kind: TabKind::Term(tt), .. }) = self.tabs.get(self.active) {
+        if let Some(Tab {
+            kind: TabKind::Term(tt),
+            ..
+        }) = self.tabs.get(self.active)
+        {
             if let Some(tx) = &tt.tx {
                 let _ = tx.send(ShellCmd::Input(bytes.to_vec()));
             }
@@ -662,9 +881,17 @@ impl App {
         if s.is_empty() {
             return;
         }
-        let (user, rest) = s.split_once('@').map(|(u, r)| (u.to_string(), r.to_string())).unwrap_or_else(|| {
-            (std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "root".into()), s.clone())
-        });
+        let (user, rest) = s
+            .split_once('@')
+            .map(|(u, r)| (u.to_string(), r.to_string()))
+            .unwrap_or_else(|| {
+                (
+                    std::env::var("USER")
+                        .or_else(|_| std::env::var("USERNAME"))
+                        .unwrap_or_else(|_| "root".into()),
+                    s.clone(),
+                )
+            });
         let (host, port) = match rest.rsplit_once(':') {
             Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
             _ => (rest, 22),
@@ -697,15 +924,20 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
         self.top_bar(ui);
         self.status_bar(ui);
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(c(self.theme.bg))).show(ui, |ui| self.tab_body(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(c(self.theme.bg)))
+            .show(ui, |ui| self.tab_body(ui));
         self.dialogs(&ctx);
-        self.toasts.retain(|(_, t)| t.elapsed() < Duration::from_secs(5));
+        self.toasts
+            .retain(|(_, t)| t.elapsed() < Duration::from_secs(5));
         if !self.toasts.is_empty() {
-            egui::Area::new(egui::Id::unique("toasts")).anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -36.0]).show(&ctx, |ui| {
-                for (s, _) in &self.toasts {
-                    egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(s));
-                }
-            });
+            egui::Area::new(egui::Id::unique("toasts"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-12.0, -36.0])
+                .show(&ctx, |ui| {
+                    for (s, _) in &self.toasts {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(s));
+                    }
+                });
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         self.save_if_dirty();
@@ -761,18 +993,62 @@ impl App {
         });
     }
 
+    fn zoom_font(&mut self, factor: f32) {
+        let cur = self.lib.settings.font_size;
+        let new = (cur * factor).clamp(8.0, 40.0);
+        // round to half points so repeated wheel ticks feel like discrete steps
+        let new = if (factor - 1.0).abs() < 0.2 && (new - cur).abs() < 0.5 {
+            cur + (factor - 1.0).signum() * 0.5
+        } else {
+            new
+        };
+        let new = ((new * 2.0).round() / 2.0).clamp(8.0, 40.0);
+        if new != cur {
+            self.mutate(|l| l.settings.font_size = new);
+        }
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
         let k = |m: Modifiers, key: Key| KeyboardShortcut::new(m, key);
+        // Font zoom: Ctrl + / Ctrl - / Ctrl 0 (like Termius)
+        for m in [Modifiers::COMMAND, Modifiers::COMMAND | Modifiers::SHIFT] {
+            if ctx.input_mut(|i| {
+                i.consume_shortcut(&k(m, Key::Equals)) | i.consume_shortcut(&k(m, Key::Plus))
+            }) {
+                self.zoom_font(1.1);
+            }
+            if ctx.input_mut(|i| i.consume_shortcut(&k(m, Key::Minus))) {
+                self.zoom_font(1.0 / 1.1);
+            }
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&k(Modifiers::COMMAND, Key::Num0))) {
+            self.mutate(|l| l.settings.font_size = 14.0);
+        }
         if ctx.input_mut(|i| i.consume_shortcut(&k(Modifiers::COMMAND, Key::K))) {
             self.palette = Some(String::new());
         }
-        if ctx.input_mut(|i| i.consume_shortcut(&k(Modifiers::COMMAND | Modifiers::SHIFT, Key::W))) {
+        if ctx.input_mut(|i| i.consume_shortcut(&k(Modifiers::COMMAND | Modifiers::SHIFT, Key::W)))
+        {
             let a = self.active;
             self.close_tab(a);
         }
-        for (n, key) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9].into_iter().enumerate() {
-            if ctx.input_mut(|i| i.consume_shortcut(&k(Modifiers::ALT, key))) && n < self.tabs.len() {
+        for (n, key) in [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Num9,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if ctx.input_mut(|i| i.consume_shortcut(&k(Modifiers::ALT, key))) && n < self.tabs.len()
+            {
                 self.active = n;
             }
         }
@@ -781,7 +1057,9 @@ impl App {
     fn vpn_chip(&mut self, ui: &mut egui::Ui) {
         let p = &self.lib.settings.vpn;
         if !p.enabled {
-            ui.label(RichText::new("🛡 VPN off").weak()).on_hover_text("SSH traffic is not forced through a VPN. Enable in Settings → VPN.");
+            ui.label(RichText::new("🛡 VPN off").weak()).on_hover_text(
+                "SSH traffic is not forced through a VPN. Enable in Settings → VPN.",
+            );
             return;
         }
         if self.vpn_status.0.elapsed() > Duration::from_secs(2) {
@@ -801,91 +1079,158 @@ impl App {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("tabs").frame(egui::Frame::NONE.fill(c(self.theme.bg)).inner_margin(egui::Margin::symmetric(8, 6))).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let mut close: Option<usize> = None;
-                let mut activate: Option<usize> = None;
-                for (i, t) in self.tabs.iter().enumerate() {
-                    let sel = i == self.active;
-                    let dot = match &t.kind {
-                        TabKind::Term(tt) => match tt.state {
-                            TermState::Ready => "● ",
-                            TermState::Connecting => "◌ ",
-                            TermState::Closed(_) => "○ ",
-                        },
-                        TabKind::Home => "⌂ ",
-                        _ => "",
-                    };
-                    let r = ui.selectable_label(sel, format!("{dot}{}", t.title));
-                    if r.clicked() {
-                        activate = Some(i);
+        egui::Panel::top("tabs")
+            .frame(
+                egui::Frame::NONE
+                    .fill(c(self.theme.bg))
+                    .inner_margin(egui::Margin::symmetric(8, 6)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let mut close: Option<usize> = None;
+                    let mut activate: Option<usize> = None;
+                    for (i, t) in self.tabs.iter().enumerate() {
+                        let sel = i == self.active;
+                        let dot = match &t.kind {
+                            TabKind::Term(tt) => match tt.state {
+                                TermState::Ready => "● ",
+                                TermState::Connecting => "◌ ",
+                                TermState::Closed(_) => "○ ",
+                            },
+                            TabKind::Home => "⌂ ",
+                            _ => "",
+                        };
+                        let accent = c(self.lib.settings.accent);
+                        let txt = RichText::new(format!("{dot}{}", t.title)).color(if sel {
+                            c(self.theme.fg)
+                        } else {
+                            c(self.theme.fg).gamma_multiply(0.6)
+                        });
+                        let r = ui.add(
+                            egui::Button::new(txt)
+                                .selected(sel)
+                                .min_size(egui::vec2(0.0, 26.0))
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .fill(if sel {
+                                    c(self.theme.selection).gamma_multiply(0.7)
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                }),
+                        );
+                        if sel {
+                            let y = r.rect.bottom() + 2.0;
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(r.rect.left() + 6.0, y),
+                                    egui::pos2(r.rect.right() - 6.0, y),
+                                ],
+                                egui::Stroke::new(2.0, accent),
+                            );
+                        }
+                        if r.clicked() {
+                            activate = Some(i);
+                        }
+                        if r.middle_clicked() {
+                            close = Some(i);
+                        }
+                        if i > 0 && ui.small_button("×").clicked() {
+                            close = Some(i);
+                        }
+                        ui.add_space(4.0);
                     }
-                    if r.middle_clicked() {
-                        close = Some(i);
+                    if let Some(i) = activate {
+                        self.active = i;
                     }
-                    if i > 0 && ui.small_button("×").clicked() {
-                        close = Some(i);
+                    if let Some(i) = close {
+                        self.close_tab(i);
                     }
-                    ui.add_space(4.0);
-                }
-                if let Some(i) = activate {
-                    self.active = i;
-                }
-                if let Some(i) = close {
-                    self.close_tab(i);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("🔒").on_hover_text("Lock vault").clicked() {
-                        self.lock();
-                    }
-                    if ui.button("⚙").on_hover_text("Settings").clicked() {
-                        self.show_settings = !self.show_settings;
-                    }
-                    if ui.button("{ } Snippets").clicked() {
-                        self.show_snippets = !self.show_snippets;
-                    }
-                    if ui.button("⌕ Ctrl+K").on_hover_text("Command palette").clicked() {
-                        self.palette = Some(String::new());
-                    }
-                    let terms = self.tabs.iter().filter(|t| matches!(&t.kind, TabKind::Term(tt) if tt.tx.is_some())).count();
-                    if terms > 1 {
-                        ui.toggle_value(&mut self.broadcast, "📡 Broadcast").on_hover_text("Type once, send to ALL open terminals");
-                    } else {
-                        self.broadcast = false;
-                    }
-                    self.vpn_chip(ui);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("🔒").on_hover_text("Lock vault").clicked() {
+                            self.lock();
+                        }
+                        if ui.button("⚙").on_hover_text("Settings").clicked() {
+                            self.show_settings = !self.show_settings;
+                        }
+                        if ui.button("{ } Snippets").clicked() {
+                            self.show_snippets = !self.show_snippets;
+                        }
+                        if ui
+                            .button("⌕ Ctrl+K")
+                            .on_hover_text("Command palette")
+                            .clicked()
+                        {
+                            self.palette = Some(String::new());
+                        }
+                        let terms = self
+                            .tabs
+                            .iter()
+                            .filter(|t| matches!(&t.kind, TabKind::Term(tt) if tt.tx.is_some()))
+                            .count();
+                        if terms > 1 {
+                            ui.toggle_value(&mut self.broadcast, "📡 Broadcast")
+                                .on_hover_text("Type once, send to ALL open terminals");
+                        } else {
+                            self.broadcast = false;
+                        }
+                        self.vpn_chip(ui);
+                    });
                 });
             });
-        });
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("status").frame(egui::Frame::NONE.fill(c(self.theme.bg)).inner_margin(egui::Margin::symmetric(10, 3))).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                match self.tabs.get(self.active).map(|t| &t.kind) {
-                    Some(TabKind::Term(tt)) => {
-                        let (cols, rows) = tt.term.size();
-                        ui.small(format!("{}@{}:{}", tt.host.username, tt.host.hostname, tt.host.port));
-                        if !tt.via.is_empty() {
-                            ui.small(&tt.via);
+        egui::Panel::bottom("status")
+            .frame(
+                egui::Frame::NONE
+                    .fill(c(self.theme.bg))
+                    .inner_margin(egui::Margin::symmetric(10, 3)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    match self.tabs.get(self.active).map(|t| &t.kind) {
+                        Some(TabKind::Term(tt)) => {
+                            let (cols, rows) = tt.term.size();
+                            ui.small(format!(
+                                "{}@{}:{}",
+                                tt.host.username, tt.host.hostname, tt.host.port
+                            ));
+                            if !tt.via.is_empty() {
+                                ui.small(&tt.via);
+                            }
+                            if !tt.forwards.is_empty() {
+                                ui.small(format!("⇄ {} forwards", tt.forwards.len()));
+                            }
+                            ui.small(format!("{cols}×{rows}"));
+                            if matches!(tt.state, TermState::Ready) {
+                                ui.small(format!("up {}", fmt_dur(tt.started.elapsed())));
+                            }
                         }
-                        if !tt.forwards.is_empty() {
-                            ui.small(format!("⇄ {} forwards", tt.forwards.len()));
-                        }
-                        ui.small(format!("{cols}×{rows}"));
-                        if matches!(tt.state, TermState::Ready) {
-                            ui.small(format!("up {}", fmt_dur(tt.started.elapsed())));
+                        _ => {
+                            ui.small(format!(
+                                "{} hosts · {} keys · {} snippets",
+                                self.lib.hosts.len(),
+                                self.lib.identities.len(),
+                                self.lib.snippets.len()
+                            ));
                         }
                     }
-                    _ => {
-                        ui.small(format!("{} hosts · {} keys · {} snippets", self.lib.hosts.len(), self.lib.identities.len(), self.lib.snippets.len()));
-                    }
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.small("vault encrypted · XChaCha20-Poly1305 + Argon2id");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.small("vault encrypted · XChaCha20-Poly1305 + Argon2id");
+                        if let Some(rel) = self.update.clone() {
+                            let label = if self.installing {
+                                "Updating…".to_string()
+                            } else if cfg!(windows) && rel.installer_url.is_some() {
+                                format!("⬆ Update to v{} — install & restart", rel.version)
+                            } else {
+                                format!("⬆ v{} available — open download", rel.version)
+                            };
+                            if ui.add_enabled(!self.installing, egui::Button::small(egui::Button::new(label))).clicked() {
+                                self.install_update();
+                            }
+                        }
+                    });
                 });
             });
-        });
     }
 
     fn tab_body(&mut self, ui: &mut egui::Ui) {
@@ -899,27 +1244,34 @@ impl App {
             TabKind::Sftp(_) => 2,
         };
         match kind_tag {
-            0 => egui::Frame::NONE.inner_margin(14.0).show(ui, |ui| self.home(ui)).inner,
+            0 => {
+                egui::Frame::NONE
+                    .inner_margin(14.0)
+                    .show(ui, |ui| self.home(ui))
+                    .inner
+            }
             1 => self.terminal_body(ui, active),
             _ => {
                 let theme = self.theme.clone();
                 let mut reopen: Option<Host> = None;
                 if let TabKind::Sftp(s) = &mut self.tabs[active].kind {
-                    egui::Frame::NONE.inner_margin(10.0).show(ui, |ui| match &mut s.state {
-                        SftpState::Connecting => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(format!("Connecting to {}…", s.host.label));
-                            });
-                        }
-                        SftpState::Failed(e) => {
-                            ui.colored_label(c(theme.ansi[1]), e.as_str());
-                            if ui.button("Retry").clicked() {
-                                reopen = Some(s.host.clone());
+                    egui::Frame::NONE
+                        .inner_margin(10.0)
+                        .show(ui, |ui| match &mut s.state {
+                            SftpState::Connecting => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(format!("Connecting to {}…", s.host.label));
+                                });
                             }
-                        }
-                        SftpState::Ready(t) => t.ui(ui, &theme),
-                    });
+                            SftpState::Failed(e) => {
+                                ui.colored_label(c(theme.ansi[1]), e.as_str());
+                                if ui.button("Retry").clicked() {
+                                    reopen = Some(s.host.clone());
+                                }
+                            }
+                            SftpState::Ready(t) => t.ui(ui, &theme),
+                        });
                 }
                 if let Some(h) = reopen {
                     self.close_tab(active);
@@ -930,8 +1282,14 @@ impl App {
     }
 
     fn terminal_body(&mut self, ui: &mut egui::Ui, idx: usize) {
-        let theme_name = if let TabKind::Term(tt) = &self.tabs[idx].kind { tt.host.theme.clone() } else { None };
-        let theme = theme_name.map(|n| theme::find(&n)).unwrap_or_else(|| self.theme.clone());
+        let theme_name = if let TabKind::Term(tt) = &self.tabs[idx].kind {
+            tt.host.theme.clone()
+        } else {
+            None
+        };
+        let theme = theme_name
+            .map(|n| theme::find(&n))
+            .unwrap_or_else(|| self.theme.clone());
         let settings = self.lib.settings.clone();
         let broadcast = self.broadcast;
         let mut reconnect = false;
@@ -940,8 +1298,11 @@ impl App {
         let mut input_out: Vec<u8> = vec![];
         let mut sftp_host: Option<Host> = None;
         let mut stop_fwd: Option<usize> = None;
+        let mut zoom = 1.0f32;
         {
-            let TabKind::Term(tt) = &mut self.tabs[idx].kind else { return };
+            let TabKind::Term(tt) = &mut self.tabs[idx].kind else {
+                return;
+            };
             match &tt.state {
                 TermState::Connecting => {
                     ui.vertical_centered(|ui| {
@@ -964,38 +1325,63 @@ impl App {
                     tt.term.show(ui, &theme, &settings, false);
                 }
                 TermState::Ready => {
-                    egui::Panel::top("term_bar").frame(egui::Frame::NONE.fill(c(theme.bg)).inner_margin(egui::Margin::symmetric(8, 2))).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.small_button("📁 SFTP").on_hover_text("Open file browser on this connection").clicked() {
-                                open_sftp = tt.conn.clone();
-                                sftp_host = Some(tt.host.clone());
-                            }
-                            if ui.small_button("⌫ Clear").clicked() {
-                                tt.term.feed(b"\x1b[2J\x1b[3J\x1b[H");
-                            }
-                            for (i, f) in tt.forwards.iter().enumerate() {
-                                let label = match f.spec.kind {
-                                    ForwardKind::Local => format!("L {}→{}:{}", f.bound_port, f.spec.dest_host, f.spec.dest_port),
-                                    ForwardKind::Remote => format!("R {}→{}:{}", f.bound_port, f.spec.dest_host, f.spec.dest_port),
-                                    ForwardKind::Dynamic => format!("SOCKS5 :{}", f.bound_port),
-                                };
-                                let n = f.connections.load(std::sync::atomic::Ordering::Relaxed);
-                                if ui.small_button(format!("⇄ {label} ({n}) ✕")).on_hover_text("Click to stop this forward").clicked() {
-                                    stop_fwd = Some(i);
+                    egui::Panel::top("term_bar")
+                        .frame(
+                            egui::Frame::NONE
+                                .fill(c(theme.bg))
+                                .inner_margin(egui::Margin::symmetric(8, 2)),
+                        )
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .small_button("📁 SFTP")
+                                    .on_hover_text("Open file browser on this connection")
+                                    .clicked()
+                                {
+                                    open_sftp = tt.conn.clone();
+                                    sftp_host = Some(tt.host.clone());
                                 }
-                            }
-                            for w in &tt.warnings {
-                                ui.colored_label(c(theme.ansi[3]), w);
-                            }
+                                if ui.small_button("⌫ Clear").clicked() {
+                                    tt.term.feed(b"\x1b[2J\x1b[3J\x1b[H");
+                                }
+                                for (i, f) in tt.forwards.iter().enumerate() {
+                                    let label = match f.spec.kind {
+                                        ForwardKind::Local => format!(
+                                            "L {}→{}:{}",
+                                            f.bound_port, f.spec.dest_host, f.spec.dest_port
+                                        ),
+                                        ForwardKind::Remote => format!(
+                                            "R {}→{}:{}",
+                                            f.bound_port, f.spec.dest_host, f.spec.dest_port
+                                        ),
+                                        ForwardKind::Dynamic => format!("SOCKS5 :{}", f.bound_port),
+                                    };
+                                    let n =
+                                        f.connections.load(std::sync::atomic::Ordering::Relaxed);
+                                    if ui
+                                        .small_button(format!("⇄ {label} ({n}) ✕"))
+                                        .on_hover_text("Click to stop this forward")
+                                        .clicked()
+                                    {
+                                        stop_fwd = Some(i);
+                                    }
+                                }
+                                for w in &tt.warnings {
+                                    ui.colored_label(c(theme.ansi[3]), w);
+                                }
+                            });
                         });
-                    });
                     let out = tt.term.show(ui, &theme, &settings, true);
+                    zoom = out.zoom;
                     if let Some(l) = out.submitted {
                         submitted = Some(l);
                     }
                     if let Some((cols, rows)) = out.resize {
                         if let Some(tx) = &tt.tx {
-                            let _ = tx.send(ShellCmd::Resize { cols: cols as u32, rows: rows as u32 });
+                            let _ = tx.send(ShellCmd::Resize {
+                                cols: cols as u32,
+                                rows: rows as u32,
+                            });
                         }
                     }
                     input_out = out.input;
@@ -1016,13 +1402,22 @@ impl App {
         if broadcast && !input_out.is_empty() {
             self.send_to_all(&input_out);
         }
+        if (zoom - 1.0).abs() > f32::EPSILON {
+            self.zoom_font(zoom);
+        }
         if let Some(l) = submitted {
             self.mutate(|lib| lib.push_history(&l));
         }
         if let (Some(conn), Some(host)) = (open_sftp, sftp_host) {
             let title = format!("SFTP · {}", host.label);
             let t = SftpTab::new(self.rt.clone(), self.ctx.clone(), conn);
-            self.new_tab(title, TabKind::Sftp(Box::new(SftpEntry { host, state: SftpState::Ready(Box::new(t)) })));
+            self.new_tab(
+                title,
+                TabKind::Sftp(Box::new(SftpEntry {
+                    host,
+                    state: SftpState::Ready(Box::new(t)),
+                })),
+            );
         }
         if reconnect {
             let id = self.tabs[idx].id;
@@ -1041,20 +1436,44 @@ impl App {
     fn home(&mut self, ui: &mut egui::Ui) {
         let mut actions: Vec<Action> = vec![];
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("🔍 Search hosts, tags, groups…").desired_width(280.0));
-            let r = ui.add(egui::TextEdit::singleline(&mut self.quick).hint_text("Quick connect: user@host[:port]").desired_width(280.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("🔍 Search hosts, tags, groups…")
+                    .desired_width(280.0),
+            );
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.quick)
+                    .hint_text("Quick connect: user@host[:port]")
+                    .desired_width(280.0),
+            );
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.quick_connect();
             }
             if ui.button(RichText::new("＋ New host").strong()).clicked() {
-                let mut h = Host::new("", "", &std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default());
+                let mut h = Host::new(
+                    "",
+                    "",
+                    &std::env::var("USER")
+                        .or_else(|_| std::env::var("USERNAME"))
+                        .unwrap_or_default(),
+                );
                 h.group = String::new();
                 self.editor = Some(HostEditor::new(h, true));
             }
             if ui.button("Import ~/.ssh/config").clicked() {
                 let imported = sshconfig::import_default();
-                let existing: Vec<String> = self.lib.hosts.iter().map(|h| format!("{}|{}|{}", h.hostname, h.port, h.username)).collect();
-                let fresh: Vec<Host> = imported.into_iter().filter(|h| !existing.contains(&format!("{}|{}|{}", h.hostname, h.port, h.username))).collect();
+                let existing: Vec<String> = self
+                    .lib
+                    .hosts
+                    .iter()
+                    .map(|h| format!("{}|{}|{}", h.hostname, h.port, h.username))
+                    .collect();
+                let fresh: Vec<Host> = imported
+                    .into_iter()
+                    .filter(|h| {
+                        !existing.contains(&format!("{}|{}|{}", h.hostname, h.port, h.username))
+                    })
+                    .collect();
                 let n = fresh.len();
                 self.mutate(|l| l.hosts.extend(fresh));
                 self.toast(format!("Imported {n} hosts"));
@@ -1082,32 +1501,46 @@ impl App {
                 ui.label("Add one with “New host”, type user@host above to connect right away, or import your ~/.ssh/config.");
             });
         }
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let mut groups: Vec<String> = hosts.iter().map(|h| h.group.clone()).collect();
-            groups.sort();
-            groups.dedup();
-            let favs: Vec<&Host> = hosts.iter().filter(|h| h.favorite).collect();
-            if !favs.is_empty() {
-                ui.label(RichText::new("★ Favorites").strong());
-                host_grid(ui, &favs, &self.theme, &mut actions, "fav");
-                ui.add_space(10.0);
-            }
-            let mut recents: Vec<&Host> = hosts.iter().filter(|h| h.last_connected.is_some()).collect();
-            recents.sort_by_key(|h| std::cmp::Reverse(h.last_connected));
-            recents.truncate(4);
-            if !recents.is_empty() && q.is_empty() {
-                ui.label(RichText::new("Recent").strong());
-                host_grid(ui, &recents, &self.theme, &mut actions, "recent");
-                ui.add_space(10.0);
-            }
-            for g in groups {
-                let list: Vec<&Host> = hosts.iter().filter(|h| h.group == g).collect();
-                let title = if g.is_empty() { "All hosts".to_string() } else { g.clone() };
-                egui::CollapsingHeader::new(RichText::new(format!("{title}  ({})", list.len())).strong()).id_salt(format!("grp-{g}")).default_open(true).show(ui, |ui| {
-                    host_grid(ui, &list, &self.theme, &mut actions, &format!("g-{g}"));
-                });
-            }
-        });
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut groups: Vec<String> = hosts.iter().map(|h| h.group.clone()).collect();
+                groups.sort();
+                groups.dedup();
+                let favs: Vec<&Host> = hosts.iter().filter(|h| h.favorite).collect();
+                if !favs.is_empty() {
+                    ui.label(RichText::new("★ Favorites").strong());
+                    host_grid(ui, &favs, &self.theme, &mut actions, "fav");
+                    ui.add_space(10.0);
+                }
+                let mut recents: Vec<&Host> = hosts
+                    .iter()
+                    .filter(|h| h.last_connected.is_some())
+                    .collect();
+                recents.sort_by_key(|h| std::cmp::Reverse(h.last_connected));
+                recents.truncate(4);
+                if !recents.is_empty() && q.is_empty() {
+                    ui.label(RichText::new("Recent").strong());
+                    host_grid(ui, &recents, &self.theme, &mut actions, "recent");
+                    ui.add_space(10.0);
+                }
+                for g in groups {
+                    let list: Vec<&Host> = hosts.iter().filter(|h| h.group == g).collect();
+                    let title = if g.is_empty() {
+                        "All hosts".to_string()
+                    } else {
+                        g.clone()
+                    };
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!("{title}  ({})", list.len())).strong(),
+                    )
+                    .id_salt(format!("grp-{g}"))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        host_grid(ui, &list, &self.theme, &mut actions, &format!("g-{g}"));
+                    });
+                }
+            });
         for a in actions {
             match a {
                 Action::Connect(id) => {
@@ -1152,32 +1585,42 @@ impl App {
         self.palette_window(ctx);
         self.settings_window(ctx);
         if let Some(id) = self.confirm_delete.clone() {
-            let name = self.lib.host(&id).map(|h| h.label.clone()).unwrap_or_default();
-            egui::Window::new("Delete host").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                ui.label(format!("Delete “{name}”? This cannot be undone."));
-                ui.horizontal(|ui| {
-                    if ui.button("Delete").clicked() {
-                        self.mutate(|l| {
-                            l.hosts.retain(|h| h.id != id);
-                            for h in &mut l.hosts {
-                                if h.jump.as_deref() == Some(&id) {
-                                    h.jump = None;
+            let name = self
+                .lib
+                .host(&id)
+                .map(|h| h.label.clone())
+                .unwrap_or_default();
+            egui::Window::new("Delete host")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("Delete “{name}”? This cannot be undone."));
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            self.mutate(|l| {
+                                l.hosts.retain(|h| h.id != id);
+                                for h in &mut l.hosts {
+                                    if h.jump.as_deref() == Some(&id) {
+                                        h.jump = None;
+                                    }
                                 }
-                            }
-                        });
-                        self.confirm_delete = None;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.confirm_delete = None;
-                    }
+                            });
+                            self.confirm_delete = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_delete = None;
+                        }
+                    });
                 });
-            });
         }
     }
 
     fn prompt_dialog(&mut self, ctx: &egui::Context) {
         let red = c(self.theme.ansi[1]);
-        let Some(p) = self.pending.front_mut() else { return };
+        let Some(p) = self.pending.front_mut() else {
+            return;
+        };
         let mut done = false;
         match p {
             Pending::HostKey(q, reply) => {
@@ -1208,30 +1651,43 @@ impl App {
                     });
                 });
             }
-            Pending::Secret { prompt, echo, value, reply } => {
-                egui::Window::new("Authentication").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-                    ui.label(prompt.as_str());
-                    let r = ui.add(egui::TextEdit::singleline(value).password(!*echo).desired_width(280.0));
-                    // Read Enter *before* touching focus: re-requesting focus in the same frame cancels `lost_focus`.
-                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if !enter && ui.memory(|m| m.focused().is_none()) {
-                        r.request_focus();
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("OK").clicked() || enter {
-                            if let Some(rp) = reply.take() {
-                                let _ = rp.send(Some(std::mem::take(value)));
-                            }
-                            done = true;
+            Pending::Secret {
+                prompt,
+                echo,
+                value,
+                reply,
+            } => {
+                egui::Window::new("Authentication")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(prompt.as_str());
+                        let r = ui.add(
+                            egui::TextEdit::singleline(value)
+                                .password(!*echo)
+                                .desired_width(280.0),
+                        );
+                        // Read Enter *before* touching focus: re-requesting focus in the same frame cancels `lost_focus`.
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if !enter && ui.memory(|m| m.focused().is_none()) {
+                            r.request_focus();
                         }
-                        if ui.button("Cancel").clicked() {
-                            if let Some(rp) = reply.take() {
-                                let _ = rp.send(None);
+                        ui.horizontal(|ui| {
+                            if ui.button("OK").clicked() || enter {
+                                if let Some(rp) = reply.take() {
+                                    let _ = rp.send(Some(std::mem::take(value)));
+                                }
+                                done = true;
                             }
-                            done = true;
-                        }
+                            if ui.button("Cancel").clicked() {
+                                if let Some(rp) = reply.take() {
+                                    let _ = rp.send(None);
+                                }
+                                done = true;
+                            }
+                        });
                     });
-                });
             }
         }
         if done {
@@ -1243,132 +1699,253 @@ impl App {
         let Some(ed) = &mut self.editor else { return };
         let mut save = false;
         let mut cancel = false;
-        let hosts_for_jump: Vec<(Id, String)> = self.lib.hosts.iter().filter(|h| h.id != ed.host.id).map(|h| (h.id.clone(), h.label.clone())).collect();
-        let identities: Vec<(Id, String)> = self.lib.identities.iter().map(|i| (i.id.clone(), i.name.clone())).collect();
+        let hosts_for_jump: Vec<(Id, String)> = self
+            .lib
+            .hosts
+            .iter()
+            .filter(|h| h.id != ed.host.id)
+            .map(|h| (h.id.clone(), h.label.clone()))
+            .collect();
+        let identities: Vec<(Id, String)> = self
+            .lib
+            .identities
+            .iter()
+            .map(|i| (i.id.clone(), i.name.clone()))
+            .collect();
         let themes = theme::themes();
-        egui::Window::new(if ed.is_new { "Unknown host key" } else { "Edit host" }).collapsible(false).default_width(520.0).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| {
-                egui::Grid::new("host_form").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                    ui.label("Label");
-                    ui.text_edit_singleline(&mut ed.host.label);
-                    ui.end_row();
-                    ui.label("Hostname / IP");
-                    ui.text_edit_singleline(&mut ed.host.hostname);
-                    ui.end_row();
-                    ui.label("Port");
-                    ui.add(egui::DragValue::new(&mut ed.host.port).range(1..=65535));
-                    ui.end_row();
-                    ui.label("Username");
-                    ui.text_edit_singleline(&mut ed.host.username);
-                    ui.end_row();
-                    ui.label("Authentication");
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut ed.auth_kind, 0, "Ask");
-                        ui.selectable_value(&mut ed.auth_kind, 1, "Password");
-                        ui.selectable_value(&mut ed.auth_kind, 2, "Saved key");
-                        ui.selectable_value(&mut ed.auth_kind, 3, "Key file");
-                    });
-                    ui.end_row();
-                    match ed.auth_kind {
-                        1 => {
-                            ui.label("Password");
-                            ui.add(egui::TextEdit::singleline(&mut ed.password).password(true));
+        egui::Window::new(if ed.is_new {
+            "Unknown host key"
+        } else {
+            "Edit host"
+        })
+        .collapsible(false)
+        .default_width(520.0)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(560.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("host_form")
+                        .num_columns(2)
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Label");
+                            ui.text_edit_singleline(&mut ed.host.label);
                             ui.end_row();
-                        }
-                        2 => {
-                            ui.label("Key");
-                            egui::ComboBox::from_id_salt("ident").selected_text(identities.iter().find(|i| i.0 == ed.identity).map(|i| i.1.clone()).unwrap_or_else(|| "choose…".into())).show_ui(ui, |ui| {
-                                for (id, name) in &identities {
-                                    ui.selectable_value(&mut ed.identity, id.clone(), name);
-                                }
+                            ui.label("Hostname / IP");
+                            ui.text_edit_singleline(&mut ed.host.hostname);
+                            ui.end_row();
+                            ui.label("Port");
+                            ui.add(egui::DragValue::new(&mut ed.host.port).range(1..=65535));
+                            ui.end_row();
+                            ui.label("Username");
+                            ui.text_edit_singleline(&mut ed.host.username);
+                            ui.end_row();
+                            ui.label("Authentication");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut ed.auth_kind, 0, "Ask");
+                                ui.selectable_value(&mut ed.auth_kind, 1, "Password");
+                                ui.selectable_value(&mut ed.auth_kind, 2, "Saved key");
+                                ui.selectable_value(&mut ed.auth_kind, 3, "Key file");
                             });
                             ui.end_row();
-                        }
-                        3 => {
-                            ui.label("Key file");
-                            ui.text_edit_singleline(&mut ed.keyfile);
+                            match ed.auth_kind {
+                                1 => {
+                                    ui.label("Password");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut ed.password).password(true),
+                                    );
+                                    ui.end_row();
+                                }
+                                2 => {
+                                    ui.label("Key");
+                                    egui::ComboBox::from_id_salt("ident")
+                                        .selected_text(
+                                            identities
+                                                .iter()
+                                                .find(|i| i.0 == ed.identity)
+                                                .map(|i| i.1.clone())
+                                                .unwrap_or_else(|| "choose…".into()),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (id, name) in &identities {
+                                                ui.selectable_value(
+                                                    &mut ed.identity,
+                                                    id.clone(),
+                                                    name,
+                                                );
+                                            }
+                                        });
+                                    ui.end_row();
+                                }
+                                3 => {
+                                    ui.label("Key file");
+                                    ui.text_edit_singleline(&mut ed.keyfile);
+                                    ui.end_row();
+                                    ui.label("Passphrase");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut ed.keypass).password(true),
+                                    );
+                                    ui.end_row();
+                                }
+                                _ => {}
+                            }
+                            ui.label("Group");
+                            ui.text_edit_singleline(&mut ed.host.group);
                             ui.end_row();
-                            ui.label("Passphrase");
-                            ui.add(egui::TextEdit::singleline(&mut ed.keypass).password(true));
+                            ui.label("Tags");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut ed.tags)
+                                    .hint_text("prod, db, eu-west"),
+                            );
                             ui.end_row();
-                        }
-                        _ => {}
-                    }
-                    ui.label("Group");
-                    ui.text_edit_singleline(&mut ed.host.group);
-                    ui.end_row();
-                    ui.label("Tags");
-                    ui.add(egui::TextEdit::singleline(&mut ed.tags).hint_text("prod, db, eu-west"));
-                    ui.end_row();
-                    ui.label("Jump host");
-                    egui::ComboBox::from_id_salt("jump").selected_text(hosts_for_jump.iter().find(|h| Some(&h.0) == ed.host.jump.as_ref()).map(|h| h.1.clone()).unwrap_or_else(|| "none".into())).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut ed.host.jump, None, "none");
-                        for (id, name) in &hosts_for_jump {
-                            ui.selectable_value(&mut ed.host.jump, Some(id.clone()), name);
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("VPN");
-                    egui::ComboBox::from_id_salt("vpn").selected_text(["Follow global setting", "Always require VPN", "Never use VPN"][ed.vpn_choice.min(2)]).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut ed.vpn_choice, 0, "Follow global setting");
-                        ui.selectable_value(&mut ed.vpn_choice, 1, "Always require VPN");
-                        ui.selectable_value(&mut ed.vpn_choice, 2, "Never use VPN");
-                    });
-                    ui.end_row();
-                    ui.label("Terminal theme");
-                    egui::ComboBox::from_id_salt("hth").selected_text(if ed.theme.is_empty() { "global default" } else { ed.theme.as_str() }).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut ed.theme, String::new(), "global default");
-                        for t in &themes {
-                            ui.selectable_value(&mut ed.theme, t.name.to_string(), t.name);
-                        }
-                    });
-                    ui.end_row();
-                    ui.label("Keep-alive (s)");
-                    ui.add(egui::DragValue::new(&mut ed.host.keepalive_secs).range(0..=600));
-                    ui.end_row();
-                    ui.label("Run after login");
-                    ui.add(egui::TextEdit::multiline(&mut ed.startup).desired_rows(2).hint_text("one command per line"));
-                    ui.end_row();
-                    ui.label("Environment");
-                    ui.add(egui::TextEdit::multiline(&mut ed.env).desired_rows(2).hint_text("KEY=value (server must allow AcceptEnv)"));
-                    ui.end_row();
-                    ui.label("Notes");
-                    ui.add(egui::TextEdit::multiline(&mut ed.host.notes).desired_rows(2));
-                    ui.end_row();
-                });
-                ui.separator();
-                ui.label(RichText::new("Port forwarding").strong());
-                let mut remove: Option<usize> = None;
-                for (i, f) in ed.host.forwards.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        egui::ComboBox::from_id_salt(("fk", i)).width(90.0).selected_text(match f.kind {
-                            ForwardKind::Local => "Local -L",
-                            ForwardKind::Remote => "Remote -R",
-                            ForwardKind::Dynamic => "SOCKS -D",
-                        }).show_ui(ui, |ui| {
-                            ui.selectable_value(&mut f.kind, ForwardKind::Local, "Local -L");
-                            ui.selectable_value(&mut f.kind, ForwardKind::Remote, "Remote -R");
-                            ui.selectable_value(&mut f.kind, ForwardKind::Dynamic, "SOCKS -D");
+                            ui.label("Jump host");
+                            egui::ComboBox::from_id_salt("jump")
+                                .selected_text(
+                                    hosts_for_jump
+                                        .iter()
+                                        .find(|h| Some(&h.0) == ed.host.jump.as_ref())
+                                        .map(|h| h.1.clone())
+                                        .unwrap_or_else(|| "none".into()),
+                                )
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut ed.host.jump, None, "none");
+                                    for (id, name) in &hosts_for_jump {
+                                        ui.selectable_value(
+                                            &mut ed.host.jump,
+                                            Some(id.clone()),
+                                            name,
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("VPN");
+                            egui::ComboBox::from_id_salt("vpn")
+                                .selected_text(
+                                    [
+                                        "Follow global setting",
+                                        "Always require VPN",
+                                        "Never use VPN",
+                                    ][ed.vpn_choice.min(2)],
+                                )
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut ed.vpn_choice,
+                                        0,
+                                        "Follow global setting",
+                                    );
+                                    ui.selectable_value(
+                                        &mut ed.vpn_choice,
+                                        1,
+                                        "Always require VPN",
+                                    );
+                                    ui.selectable_value(&mut ed.vpn_choice, 2, "Never use VPN");
+                                });
+                            ui.end_row();
+                            ui.label("Terminal theme");
+                            egui::ComboBox::from_id_salt("hth")
+                                .selected_text(if ed.theme.is_empty() {
+                                    "global default"
+                                } else {
+                                    ed.theme.as_str()
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut ed.theme,
+                                        String::new(),
+                                        "global default",
+                                    );
+                                    for t in &themes {
+                                        ui.selectable_value(
+                                            &mut ed.theme,
+                                            t.name.to_string(),
+                                            t.name,
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("Keep-alive (s)");
+                            ui.add(
+                                egui::DragValue::new(&mut ed.host.keepalive_secs).range(0..=600),
+                            );
+                            ui.end_row();
+                            ui.label("Run after login");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut ed.startup)
+                                    .desired_rows(2)
+                                    .hint_text("one command per line"),
+                            );
+                            ui.end_row();
+                            ui.label("Environment");
+                            ui.add(
+                                egui::TextEdit::multiline(&mut ed.env)
+                                    .desired_rows(2)
+                                    .hint_text("KEY=value (server must allow AcceptEnv)"),
+                            );
+                            ui.end_row();
+                            ui.label("Notes");
+                            ui.add(egui::TextEdit::multiline(&mut ed.host.notes).desired_rows(2));
+                            ui.end_row();
                         });
-                        ui.add(egui::TextEdit::singleline(&mut f.bind_host).desired_width(80.0));
-                        ui.add(egui::DragValue::new(&mut f.bind_port));
-                        if f.kind != ForwardKind::Dynamic {
-                            ui.label("→");
-                            ui.add(egui::TextEdit::singleline(&mut f.dest_host).desired_width(110.0));
-                            ui.add(egui::DragValue::new(&mut f.dest_port));
-                        }
-                        if ui.small_button("✕").clicked() {
-                            remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = remove {
-                    ed.host.forwards.remove(i);
-                }
-                if ui.button("＋ Add forward").clicked() {
-                    ed.host.forwards.push(PortForward { kind: ForwardKind::Local, bind_host: "127.0.0.1".into(), bind_port: 8080, dest_host: "localhost".into(), dest_port: 80 });
-                }
-            });
+                    ui.separator();
+                    ui.label(RichText::new("Port forwarding").strong());
+                    let mut remove: Option<usize> = None;
+                    for (i, f) in ed.host.forwards.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt(("fk", i))
+                                .width(90.0)
+                                .selected_text(match f.kind {
+                                    ForwardKind::Local => "Local -L",
+                                    ForwardKind::Remote => "Remote -R",
+                                    ForwardKind::Dynamic => "SOCKS -D",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut f.kind,
+                                        ForwardKind::Local,
+                                        "Local -L",
+                                    );
+                                    ui.selectable_value(
+                                        &mut f.kind,
+                                        ForwardKind::Remote,
+                                        "Remote -R",
+                                    );
+                                    ui.selectable_value(
+                                        &mut f.kind,
+                                        ForwardKind::Dynamic,
+                                        "SOCKS -D",
+                                    );
+                                });
+                            ui.add(
+                                egui::TextEdit::singleline(&mut f.bind_host).desired_width(80.0),
+                            );
+                            ui.add(egui::DragValue::new(&mut f.bind_port));
+                            if f.kind != ForwardKind::Dynamic {
+                                ui.label("→");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.dest_host)
+                                        .desired_width(110.0),
+                                );
+                                ui.add(egui::DragValue::new(&mut f.dest_port));
+                            }
+                            if ui.small_button("✕").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(i) = remove {
+                        ed.host.forwards.remove(i);
+                    }
+                    if ui.button("＋ Add forward").clicked() {
+                        ed.host.forwards.push(PortForward {
+                            kind: ForwardKind::Local,
+                            bind_host: "127.0.0.1".into(),
+                            bind_port: 8080,
+                            dest_host: "localhost".into(),
+                            dest_port: 80,
+                        });
+                    }
+                });
             if !ed.error.is_empty() {
                 ui.colored_label(egui::Color32::LIGHT_RED, &ed.error);
             }
@@ -1444,15 +2021,30 @@ impl App {
         }
         if add {
             let (n, cmd) = std::mem::take(&mut self.snippet_draft);
-            let name = if n.trim().is_empty() { cmd.chars().take(24).collect() } else { n };
-            self.mutate(|l| l.snippets.push(Snippet { id: new_id(), name, command: cmd, tags: vec![] }));
+            let name = if n.trim().is_empty() {
+                cmd.chars().take(24).collect()
+            } else {
+                n
+            };
+            self.mutate(|l| {
+                l.snippets.push(Snippet {
+                    id: new_id(),
+                    name,
+                    command: cmd,
+                    tags: vec![],
+                })
+            });
         }
         if let Some(id) = delete {
             self.mutate(|l| l.snippets.retain(|s| s.id != id));
         }
         if let Some((cmd, all)) = run {
             let bytes = format!("{cmd}\r").into_bytes();
-            if all { self.send_to_all(&bytes) } else { self.send_to_active(&bytes) }
+            if all {
+                self.send_to_all(&bytes)
+            } else {
+                self.send_to_active(&bytes)
+            }
             self.mutate(|l| l.push_history(&cmd));
         }
     }
@@ -1463,31 +2055,61 @@ impl App {
         let mut choose: Option<Host> = None;
         let mut snippet: Option<String> = None;
         let ql = q.to_lowercase();
-        let hosts: Vec<&Host> = self.lib.hosts.iter().filter(|h| ql.is_empty() || fuzzy(&ql, &format!("{} {} {}", h.label, h.hostname, h.tags.join(" ")).to_lowercase())).take(8).collect();
-        let snips: Vec<&Snippet> = self.lib.snippets.iter().filter(|s| !ql.is_empty() && fuzzy(&ql, &s.name.to_lowercase())).take(4).collect();
-        egui::Window::new("palette").title_bar(false).resizable(false).anchor(egui::Align2::CENTER_TOP, [0.0, 80.0]).fixed_size([480.0, 0.0]).show(ctx, |ui| {
-            let r = ui.add(egui::TextEdit::singleline(q).hint_text("Connect to… (Esc to close)").desired_width(f32::INFINITY));
-            r.request_focus();
-            for (i, h) in hosts.iter().enumerate() {
-                let label = format!("🖥  {}   {}@{}", h.label, h.username, h.hostname);
-                if ui.selectable_label(i == 0, label).clicked() {
-                    choose = Some((*h).clone());
+        let hosts: Vec<&Host> = self
+            .lib
+            .hosts
+            .iter()
+            .filter(|h| {
+                ql.is_empty()
+                    || fuzzy(
+                        &ql,
+                        &format!("{} {} {}", h.label, h.hostname, h.tags.join(" ")).to_lowercase(),
+                    )
+            })
+            .take(8)
+            .collect();
+        let snips: Vec<&Snippet> = self
+            .lib
+            .snippets
+            .iter()
+            .filter(|s| !ql.is_empty() && fuzzy(&ql, &s.name.to_lowercase()))
+            .take(4)
+            .collect();
+        egui::Window::new("palette")
+            .title_bar(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
+            .fixed_size([480.0, 0.0])
+            .show(ctx, |ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(q)
+                        .hint_text("Connect to… (Esc to close)")
+                        .desired_width(f32::INFINITY),
+                );
+                r.request_focus();
+                for (i, h) in hosts.iter().enumerate() {
+                    let label = format!("🖥  {}   {}@{}", h.label, h.username, h.hostname);
+                    if ui.selectable_label(i == 0, label).clicked() {
+                        choose = Some((*h).clone());
+                    }
                 }
-            }
-            for s in &snips {
-                if ui.selectable_label(false, format!("{{ }}  {}  {}", s.name, s.command)).clicked() {
-                    snippet = Some(s.command.clone());
+                for s in &snips {
+                    if ui
+                        .selectable_label(false, format!("{{ }}  {}  {}", s.name, s.command))
+                        .clicked()
+                    {
+                        snippet = Some(s.command.clone());
+                    }
                 }
-            }
-            if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                if let Some(h) = hosts.first() {
-                    choose = Some((*h).clone());
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if let Some(h) = hosts.first() {
+                        choose = Some((*h).clone());
+                    }
                 }
-            }
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                close = true;
-            }
-        });
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
+            });
         if choose.is_some() || snippet.is_some() || close {
             self.palette = None;
         }
@@ -1528,8 +2150,13 @@ impl App {
                 SettingsTab::About => {
                     ui.heading("sshield");
                     ui.label(format!("version {}", env!("CARGO_PKG_VERSION")));
-                    ui.label("Free and open source (Apache-2.0). No accounts, no telemetry, no paywalls.");
+                    ui.label("Free and open source (Apache-2.0). No accounts, no telemetry (the optional update check only contacts GitHub), no paywalls.");
                     ui.label(format!("Data directory: {}", self.data_dir.display()));
+                    ui.separator();
+                    ui.checkbox(&mut self.lib.settings.check_updates, "Check for updates at startup (contacts api.github.com only)");
+                    if ui.button("Check for updates now").clicked() {
+                        self.check_update(true);
+                    }
                 }
             });
         });
@@ -1544,47 +2171,66 @@ impl App {
 
     fn settings_general(&mut self, ui: &mut egui::Ui) {
         let st = &mut self.lib.settings;
-        egui::Grid::new("gen").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-            ui.label("Theme");
-            egui::ComboBox::from_id_salt("theme").selected_text(st.theme.clone()).show_ui(ui, |ui| {
-                for t in theme::themes() {
-                    ui.selectable_value(&mut st.theme, t.name.to_string(), t.name);
+        egui::Grid::new("gen")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Theme");
+                egui::ComboBox::from_id_salt("theme")
+                    .selected_text(st.theme.clone())
+                    .show_ui(ui, |ui| {
+                        for t in theme::themes() {
+                            ui.selectable_value(&mut st.theme, t.name.to_string(), t.name);
+                        }
+                    });
+                ui.end_row();
+                ui.label("Accent colour");
+                let mut col = c(st.accent);
+                if ui.color_edit_button_srgba(&mut col).changed() {
+                    st.accent = ((col.r() as u32) << 16) | ((col.g() as u32) << 8) | col.b() as u32;
+                }
+                ui.end_row();
+                ui.label("Terminal font size");
+                ui.add(egui::Slider::new(&mut st.font_size, 8.0..=32.0));
+                ui.end_row();
+                ui.label("Font file (.ttf)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut st.font_family)
+                        .hint_text(r"C:\Windows\Fonts\CascadiaMono.ttf"),
+                );
+                ui.end_row();
+                ui.label("UI scale");
+                ui.add(egui::Slider::new(&mut st.ui_scale, 0.8..=1.8));
+                ui.end_row();
+                ui.label("Scrollback lines");
+                ui.add(
+                    egui::DragValue::new(&mut st.scrollback)
+                        .range(0..=200_000)
+                        .speed(100),
+                );
+                ui.end_row();
+                ui.label("");
+                ui.checkbox(&mut st.copy_on_select, "Copy on select");
+                ui.checkbox(
+                    &mut st.wheel_sends_arrows,
+                    "Mouse wheel sends arrow keys in full-screen apps (tmux, less, vim)",
+                );
+                ui.end_row();
+                ui.label("");
+                ui.checkbox(&mut st.cursor_blink, "Blinking cursor");
+                ui.end_row();
+                ui.label("");
+                ui.checkbox(&mut st.log_sessions, "Log sessions to files (raw output)");
+                ui.end_row();
+                if st.log_sessions {
+                    ui.label("Log folder");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut st.log_dir)
+                            .hint_text("(default: data dir/logs)"),
+                    );
+                    ui.end_row();
                 }
             });
-            ui.end_row();
-            ui.label("Accent colour");
-            let mut col = c(st.accent);
-            if ui.color_edit_button_srgba(&mut col).changed() {
-                st.accent = ((col.r() as u32) << 16) | ((col.g() as u32) << 8) | col.b() as u32;
-            }
-            ui.end_row();
-            ui.label("Terminal font size");
-            ui.add(egui::Slider::new(&mut st.font_size, 8.0..=32.0));
-            ui.end_row();
-            ui.label("Font file (.ttf)");
-            ui.add(egui::TextEdit::singleline(&mut st.font_family).hint_text(r"C:\Windows\Fonts\CascadiaMono.ttf"));
-            ui.end_row();
-            ui.label("UI scale");
-            ui.add(egui::Slider::new(&mut st.ui_scale, 0.8..=1.8));
-            ui.end_row();
-            ui.label("Scrollback lines");
-            ui.add(egui::DragValue::new(&mut st.scrollback).range(0..=200_000).speed(100));
-            ui.end_row();
-            ui.label("");
-            ui.checkbox(&mut st.copy_on_select, "Copy on select");
-            ui.end_row();
-            ui.label("");
-            ui.checkbox(&mut st.cursor_blink, "Blinking cursor");
-            ui.end_row();
-            ui.label("");
-            ui.checkbox(&mut st.log_sessions, "Log sessions to files (raw output)");
-            ui.end_row();
-            if st.log_sessions {
-                ui.label("Log folder");
-                ui.add(egui::TextEdit::singleline(&mut st.log_dir).hint_text("(default: data dir/logs)"));
-                ui.end_row();
-            }
-        });
         ui.small("Scrollback applies to newly opened sessions.");
     }
 
@@ -1644,7 +2290,11 @@ impl App {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Test against");
-            ui.add(egui::TextEdit::singleline(&mut self.vpn_test_target).hint_text("IP of an SSH host").desired_width(180.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.vpn_test_target)
+                    .hint_text("IP of an SSH host")
+                    .desired_width(180.0),
+            );
             if ui.button("Test VPN").clicked() {
                 let policy = p.clone();
                 let target = self.vpn_test_target.trim().to_string();
@@ -1653,8 +2303,12 @@ impl App {
                         let b = mgr.ensure_up(&policy).await.map_err(|e| e.to_string())?;
                         let mut s = format!("Tunnel '{}' is up", b.iface);
                         if !target.is_empty() {
-                            let ip: std::net::IpAddr = target.parse().map_err(|_| "test target must be an IP address".to_string())?;
-                            vpn::verify_route(&b, ip, true).await.map_err(|e| e.to_string())?;
+                            let ip: std::net::IpAddr = target
+                                .parse()
+                                .map_err(|_| "test target must be an IP address".to_string())?;
+                            vpn::verify_route(&b, ip, true)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             s.push_str(&format!("; {ip} is routed through it ✔"));
                         }
                         Ok::<_, String>(s)
@@ -1676,7 +2330,13 @@ impl App {
         let mut delete: Option<Id> = None;
         for i in &self.lib.identities {
             ui.horizontal(|ui| {
-                if ui.selectable_label(self.sel_identity.as_ref() == Some(&i.id), format!("🔑 {}", i.name)).clicked() {
+                if ui
+                    .selectable_label(
+                        self.sel_identity.as_ref() == Some(&i.id),
+                        format!("🔑 {}", i.name),
+                    )
+                    .clicked()
+                {
                     self.sel_identity = Some(i.id.clone());
                 }
                 if ui.small_button("🗑").clicked() {
@@ -1688,11 +2348,25 @@ impl App {
             self.mutate(|l| l.identities.retain(|i| i.id != id));
             self.sel_identity = None;
         }
-        if let Some(i) = self.sel_identity.as_ref().and_then(|id| self.lib.identity(id)) {
-            match sshield_core::russh::keys::decode_secret_key(&i.private_key, i.passphrase.as_deref()).and_then(|k| k.public_key().to_openssh().map_err(Into::into)) {
+        if let Some(i) = self
+            .sel_identity
+            .as_ref()
+            .and_then(|id| self.lib.identity(id))
+        {
+            match sshield_core::russh::keys::decode_secret_key(
+                &i.private_key,
+                i.passphrase.as_deref(),
+            )
+            .and_then(|k| k.public_key().to_openssh().map_err(Into::into))
+            {
                 Ok(mut pubkey) => {
                     ui.label("Public key (add to the server's authorized_keys):");
-                    ui.add(egui::TextEdit::multiline(&mut pubkey).desired_rows(3).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
+                    ui.add(
+                        egui::TextEdit::multiline(&mut pubkey)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
                     if ui.button("Copy public key").clicked() {
                         ui.ctx().copy_text(pubkey);
                     }
@@ -1704,15 +2378,30 @@ impl App {
         }
         ui.separator();
         ui.label(RichText::new("Add a key").strong());
-        ui.add(egui::TextEdit::singleline(&mut self.key_name).hint_text("name").desired_width(200.0));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.key_name)
+                .hint_text("name")
+                .desired_width(200.0),
+        );
         ui.horizontal(|ui| {
             if ui.button("Generate Ed25519").clicked() {
-                let name = if self.key_name.trim().is_empty() { "new-key".to_string() } else { self.key_name.trim().to_string() };
+                let name = if self.key_name.trim().is_empty() {
+                    "new-key".to_string()
+                } else {
+                    self.key_name.trim().to_string()
+                };
                 match ssh::generate_ed25519(&name) {
                     Ok((pem, _)) => {
                         let id = new_id();
                         self.sel_identity = Some(id.clone());
-                        self.mutate(|l| l.identities.push(Identity { id, name, private_key: pem, passphrase: None }));
+                        self.mutate(|l| {
+                            l.identities.push(Identity {
+                                id,
+                                name,
+                                private_key: pem,
+                                passphrase: None,
+                            })
+                        });
                         self.key_name.clear();
                         self.key_error.clear();
                     }
@@ -1721,23 +2410,50 @@ impl App {
             }
         });
         ui.label("…or import (path to a key file, or paste the key text):");
-        ui.add(egui::TextEdit::multiline(&mut self.key_import).desired_rows(3).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
-        ui.add(egui::TextEdit::singleline(&mut self.key_pass).password(true).hint_text("passphrase (if the key has one)"));
+        ui.add(
+            egui::TextEdit::multiline(&mut self.key_import)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut self.key_pass)
+                .password(true)
+                .hint_text("passphrase (if the key has one)"),
+        );
         if ui.button("Import").clicked() {
             let src = self.key_import.trim().to_string();
-            let text = if src.contains("PRIVATE KEY") || src.starts_with("PuTTY-User-Key-File") { src.clone() } else { std::fs::read_to_string(&src).unwrap_or_default() };
+            let text = if src.contains("PRIVATE KEY") || src.starts_with("PuTTY-User-Key-File") {
+                src.clone()
+            } else {
+                std::fs::read_to_string(&src).unwrap_or_default()
+            };
             let pass = (!self.key_pass.is_empty()).then(|| self.key_pass.clone());
             match sshield_core::russh::keys::decode_secret_key(&text, pass.as_deref()) {
                 Ok(_) => {
-                    let name = if self.key_name.trim().is_empty() { "imported-key".to_string() } else { self.key_name.trim().to_string() };
+                    let name = if self.key_name.trim().is_empty() {
+                        "imported-key".to_string()
+                    } else {
+                        self.key_name.trim().to_string()
+                    };
                     let id = new_id();
                     self.sel_identity = Some(id.clone());
-                    self.mutate(|l| l.identities.push(Identity { id, name, private_key: text, passphrase: pass }));
+                    self.mutate(|l| {
+                        l.identities.push(Identity {
+                            id,
+                            name,
+                            private_key: text,
+                            passphrase: pass,
+                        })
+                    });
                     self.key_import.clear();
                     self.key_pass.clear();
                     self.key_error.clear();
                 }
-                Err(e) => self.key_error = format!("Could not read key: {e} (wrong passphrase, or not a key file?)"),
+                Err(e) => {
+                    self.key_error =
+                        format!("Could not read key: {e} (wrong passphrase, or not a key file?)")
+                }
             }
         }
         if !self.key_error.is_empty() {
@@ -1748,7 +2464,11 @@ impl App {
     fn settings_security(&mut self, ui: &mut egui::Ui) {
         ui.heading("Master password");
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.new_pw).password(true).hint_text("new master password (min 8)"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_pw)
+                    .password(true)
+                    .hint_text("new master password (min 8)"),
+            );
             if ui.button("Change").clicked() {
                 if self.new_pw.chars().count() < 8 {
                     self.toast("Use at least 8 characters");
@@ -1756,7 +2476,8 @@ impl App {
                     match v.change_password(&self.new_pw, &self.lib) {
                         Ok(_) => {
                             self.new_pw.clear();
-                            self.toasts.push(("Master password changed".into(), Instant::now()));
+                            self.toasts
+                                .push(("Master password changed".into(), Instant::now()));
                         }
                         Err(e) => self.toasts.push((format!("Failed: {e}"), Instant::now())),
                     }
@@ -1766,7 +2487,11 @@ impl App {
         ui.separator();
         ui.heading("Sync (no account needed)");
         ui.label("Point this at a folder that Dropbox / OneDrive / iCloud / Syncthing / a NAS already syncs. sshield writes the encrypted vault there on every change. Open the same file on another machine by copying it into that machine's data directory. The file is useless without your master password.");
-        ui.add(egui::TextEdit::singleline(&mut self.lib.settings.sync_dir).hint_text("e.g. D:\\Dropbox\\sshield").desired_width(f32::INFINITY));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.lib.settings.sync_dir)
+                .hint_text("e.g. D:\\Dropbox\\sshield")
+                .desired_width(f32::INFINITY),
+        );
         ui.small("Mirroring is one-way (this machine → folder); sshield does not merge concurrent edits from two machines.");
         ui.separator();
         ui.label(format!("Vault file: {}", self.vault_path().display()));
@@ -1780,7 +2505,9 @@ impl App {
         let mut changed = false;
         for (i, (kw, col)) in self.lib.settings.highlights.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                changed |= ui.add(egui::TextEdit::singleline(kw).desired_width(140.0)).changed();
+                changed |= ui
+                    .add(egui::TextEdit::singleline(kw).desired_width(140.0))
+                    .changed();
                 let mut cc = c(*col);
                 if ui.color_edit_button_srgba(&mut cc).changed() {
                     *col = ((cc.r() as u32) << 16) | ((cc.g() as u32) << 8) | cc.b() as u32;
@@ -1795,13 +2522,21 @@ impl App {
             self.lib.settings.highlights.remove(i);
         }
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.new_highlight.0).hint_text("keyword").desired_width(140.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_highlight.0)
+                    .hint_text("keyword")
+                    .desired_width(140.0),
+            );
             let mut cc = c(self.new_highlight.1);
             if ui.color_edit_button_srgba(&mut cc).changed() {
-                self.new_highlight.1 = ((cc.r() as u32) << 16) | ((cc.g() as u32) << 8) | cc.b() as u32;
+                self.new_highlight.1 =
+                    ((cc.r() as u32) << 16) | ((cc.g() as u32) << 8) | cc.b() as u32;
             }
             if ui.button("Add").clicked() && !self.new_highlight.0.is_empty() {
-                let (k, col) = (std::mem::take(&mut self.new_highlight.0), self.new_highlight.1);
+                let (k, col) = (
+                    std::mem::take(&mut self.new_highlight.0),
+                    self.new_highlight.1,
+                );
                 self.lib.settings.highlights.push((k, col));
             }
         });
@@ -1809,80 +2544,121 @@ impl App {
     }
 }
 
-fn host_grid(ui: &mut egui::Ui, hosts: &[&Host], theme: &Theme, actions: &mut Vec<Action>, salt: &str) {
+fn host_grid(
+    ui: &mut egui::Ui,
+    hosts: &[&Host],
+    theme: &Theme,
+    actions: &mut Vec<Action>,
+    salt: &str,
+) {
     let w = 300.0;
     let cols = ((ui.available_width() / (w + 34.0)).floor() as usize).max(1);
-    egui::Grid::new(format!("grid-{salt}")).spacing([12.0, 12.0]).show(ui, |ui| {
-        for (i, h) in hosts.iter().enumerate() {
-            let frame = egui::Frame::new()
-                .fill(c(theme.bg))
-                .stroke(egui::Stroke::new(1.0, c(theme.selection)))
-                .corner_radius(10)
-                .inner_margin(12.0);
-            let r = frame.show(ui, |ui| {
-              ui.vertical(|ui| {
-                ui.set_width(w);
-                ui.horizontal(|ui| {
-                    let title = ui.add(egui::Label::new(RichText::new(&h.label).strong().size(15.0)).truncate().selectable(false).sense(egui::Sense::click()));
-                    if title.double_clicked() {
-                        actions.push(Action::Connect(h.id.clone()));
-                    }
-                    title.on_hover_text("Double-click to connect");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button(if h.favorite { "★" } else { "☆" }).clicked() {
-                            actions.push(Action::Favorite(h.id.clone()));
+    egui::Grid::new(format!("grid-{salt}"))
+        .spacing([12.0, 12.0])
+        .show(ui, |ui| {
+            for (i, h) in hosts.iter().enumerate() {
+                let frame = egui::Frame::new()
+                    .fill(c(theme.bg))
+                    .stroke(egui::Stroke::new(1.0, c(theme.selection)))
+                    .corner_radius(10)
+                    .inner_margin(12.0);
+                let r = frame.show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(w);
+                        ui.horizontal(|ui| {
+                            let title = ui.add(
+                                egui::Label::new(RichText::new(&h.label).strong().size(15.0))
+                                    .truncate()
+                                    .selectable(false)
+                                    .sense(egui::Sense::click()),
+                            );
+                            if title.double_clicked() {
+                                actions.push(Action::Connect(h.id.clone()));
+                            }
+                            title.on_hover_text("Double-click to connect");
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui
+                                    .small_button(if h.favorite { "★" } else { "☆" })
+                                    .clicked()
+                                {
+                                    actions.push(Action::Favorite(h.id.clone()));
+                                }
+                            });
+                        });
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{}@{}:{}", h.username, h.hostname, h.port))
+                                    .monospace()
+                                    .weak(),
+                            )
+                            .truncate(),
+                        );
+                        let has_meta = !h.tags.is_empty()
+                            || h.jump.is_some()
+                            || h.require_vpn == Some(true)
+                            || !h.forwards.is_empty();
+                        if has_meta {
+                            ui.horizontal(|ui| {
+                                for t in h.tags.iter().take(3) {
+                                    ui.label(
+                                        RichText::new(format!(" {t} "))
+                                            .small()
+                                            .background_color(c(theme.selection)),
+                                    );
+                                }
+                                if h.jump.is_some() {
+                                    ui.small("↪ jump");
+                                }
+                                if h.require_vpn == Some(true) {
+                                    ui.small("🛡 vpn");
+                                }
+                                if !h.forwards.is_empty() {
+                                    ui.small(format!("⇄ {}", h.forwards.len()));
+                                }
+                            });
                         }
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(RichText::new("Connect").color(c(theme.ansi[2])))
+                                .clicked()
+                            {
+                                actions.push(Action::Connect(h.id.clone()));
+                            }
+                            if ui.button("SFTP").clicked() {
+                                actions.push(Action::Sftp(h.id.clone()));
+                            }
+                            if ui.button("Edit").clicked() {
+                                actions.push(Action::Edit(h.id.clone()));
+                            }
+                            if ui
+                                .button("Copy")
+                                .on_hover_text("Duplicate this host")
+                                .clicked()
+                            {
+                                actions.push(Action::Duplicate(h.id.clone()));
+                            }
+                            if ui.button("🗑").on_hover_text("Delete").clicked() {
+                                actions.push(Action::Delete(h.id.clone()));
+                            }
+                        });
                     });
                 });
-                ui.add(egui::Label::new(RichText::new(format!("{}@{}:{}", h.username, h.hostname, h.port)).monospace().weak()).truncate());
-                let has_meta = !h.tags.is_empty() || h.jump.is_some() || h.require_vpn == Some(true) || !h.forwards.is_empty();
-                if has_meta {
-                    ui.horizontal(|ui| {
-                        for t in h.tags.iter().take(3) {
-                            ui.label(RichText::new(format!(" {t} ")).small().background_color(c(theme.selection)));
-                        }
-                        if h.jump.is_some() {
-                            ui.small("↪ jump");
-                        }
-                        if h.require_vpn == Some(true) {
-                            ui.small("🛡 vpn");
-                        }
-                        if !h.forwards.is_empty() {
-                            ui.small(format!("⇄ {}", h.forwards.len()));
-                        }
-                    });
+                let _ = r;
+                if (i + 1) % cols == 0 {
+                    ui.end_row();
                 }
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new("Connect").color(c(theme.ansi[2]))).clicked() {
-                        actions.push(Action::Connect(h.id.clone()));
-                    }
-                    if ui.button("SFTP").clicked() {
-                        actions.push(Action::Sftp(h.id.clone()));
-                    }
-                    if ui.button("Edit").clicked() {
-                        actions.push(Action::Edit(h.id.clone()));
-                    }
-                    if ui.button("Copy").on_hover_text("Duplicate this host").clicked() {
-                        actions.push(Action::Duplicate(h.id.clone()));
-                    }
-                    if ui.button("🗑").on_hover_text("Delete").clicked() {
-                        actions.push(Action::Delete(h.id.clone()));
-                    }
-                });
-              });
-            });
-            let _ = r;
-            if (i + 1) % cols == 0 {
-                ui.end_row();
             }
-        }
-    });
+        });
 }
 
 fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
-    if s >= 3600 { format!("{}h{:02}m", s / 3600, (s / 60) % 60) } else { format!("{}m{:02}s", s / 60, s % 60) }
+    if s >= 3600 {
+        format!("{}h{:02}m", s / 3600, (s / 60) % 60)
+    } else {
+        format!("{}m{:02}s", s / 60, s % 60)
+    }
 }
 
 /// Subsequence match: every char of `needle` appears in order in `hay`.
@@ -1905,7 +2681,9 @@ mod tests {
     #[test]
     fn host_editor_roundtrip_and_validation() {
         let mut h = Host::new("a", "example.com", "me");
-        h.auth = Auth::Password { password: "x".into() };
+        h.auth = Auth::Password {
+            password: "x".into(),
+        };
         h.tags = vec!["a".into(), "b".into()];
         h.startup = vec!["cd /srv".into()];
         let ed = HostEditor::new(h.clone(), false);

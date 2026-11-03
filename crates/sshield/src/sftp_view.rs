@@ -58,12 +58,21 @@ fn list_local(dir: &PathBuf, hidden: bool) -> Vec<Local> {
                     if !hidden && name.starts_with('.') {
                         return None;
                     }
-                    Some(Local { name, path: e.path(), is_dir: md.is_dir(), size: md.len() })
+                    Some(Local {
+                        name,
+                        path: e.path(),
+                        is_dir: md.is_dir(),
+                        size: md.len(),
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default();
-    v.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    v.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     v
 }
 
@@ -75,7 +84,11 @@ pub fn human(n: u64) -> String {
         v /= 1024.0;
         i += 1;
     }
-    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", units[i]) }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", units[i])
+    }
 }
 
 impl SftpTab {
@@ -208,7 +221,11 @@ impl SftpTab {
             ui.label(&self.status);
             if self.total > 0 {
                 let done = self.progress.load(Ordering::Relaxed);
-                ui.add(egui::ProgressBar::new(done as f32 / self.total as f32).desired_width(200.0).text(format!("{} / {}", human(done), human(self.total))));
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / self.total as f32)
+                        .desired_width(200.0)
+                        .text(format!("{} / {}", human(done), human(self.total))),
+                );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.checkbox(&mut self.show_hidden, "Hidden files").changed() {
@@ -233,7 +250,10 @@ impl SftpTab {
                 if ui.button("🏠").clicked() {
                     self.cd_local(dirs_home());
                 }
-                let r = ui.add(egui::TextEdit::singleline(&mut self.local_path_edit).desired_width(f32::INFINITY));
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.local_path_edit)
+                        .desired_width(f32::INFINITY),
+                );
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     let p = PathBuf::from(&self.local_path_edit);
                     if p.is_dir() {
@@ -242,21 +262,25 @@ impl SftpTab {
                 }
             });
             let mut go_local: Option<PathBuf> = None;
-            egui::ScrollArea::vertical().id_salt("local").auto_shrink([false, false]).max_height(cols[0].available_height() - 40.0).show(&mut cols[0], |ui| {
-                for (i, e) in self.local.iter().enumerate() {
-                    let label = format!("{} {}", if e.is_dir { "📁" } else { "📄" }, e.name);
-                    let r = ui.selectable_label(self.sel_local == Some(i), label);
-                    if r.clicked() {
-                        self.sel_local = Some(i);
+            egui::ScrollArea::vertical()
+                .id_salt("local")
+                .auto_shrink([false, false])
+                .max_height(cols[0].available_height() - 40.0)
+                .show(&mut cols[0], |ui| {
+                    for (i, e) in self.local.iter().enumerate() {
+                        let label = format!("{} {}", if e.is_dir { "📁" } else { "📄" }, e.name);
+                        let r = ui.selectable_label(self.sel_local == Some(i), label);
+                        if r.clicked() {
+                            self.sel_local = Some(i);
+                        }
+                        if r.double_clicked() && e.is_dir {
+                            go_local = Some(e.path.clone());
+                        }
+                        if !e.is_dir {
+                            r.on_hover_text(human(e.size));
+                        }
                     }
-                    if r.double_clicked() && e.is_dir {
-                        go_local = Some(e.path.clone());
-                    }
-                    if !e.is_dir {
-                        r.on_hover_text(human(e.size));
-                    }
-                }
-            });
+                });
             if let Some(p) = go_local {
                 self.cd_local(p);
             }
@@ -264,33 +288,59 @@ impl SftpTab {
             // ---------------- remote
             cols[1].heading("Remote");
             cols[1].horizontal(|ui| {
-                if ui.add_enabled(can_act, egui::Button::new("⬆")).on_hover_text("Parent directory").clicked() {
+                if ui
+                    .add_enabled(can_act, egui::Button::new("⬆"))
+                    .on_hover_text("Parent directory")
+                    .clicked()
+                {
                     let p = sftp::parent(&self.remote_cwd);
                     self.cd_remote(p);
                 }
                 if ui.add_enabled(can_act, egui::Button::new("⟳")).clicked() {
                     self.refresh_remote();
                 }
-                let r = ui.add(egui::TextEdit::singleline(&mut self.remote_path_edit).desired_width(f32::INFINITY));
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.remote_path_edit)
+                        .desired_width(f32::INFINITY),
+                );
                 if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && can_act {
                     let p = self.remote_path_edit.clone();
                     self.cd_remote(p);
                 }
             });
             let mut go_remote: Option<String> = None;
-            egui::ScrollArea::vertical().id_salt("remote").auto_shrink([false, false]).max_height(cols[1].available_height() - 40.0).show(&mut cols[1], |ui| {
-                for (i, e) in self.remote.iter().enumerate() {
-                    let label = format!("{} {}", if e.is_dir { "📁" } else if e.is_symlink { "🔗" } else { "📄" }, e.name);
-                    let r = ui.selectable_label(self.sel_remote == Some(i), label);
-                    if r.clicked() {
-                        self.sel_remote = Some(i);
+            egui::ScrollArea::vertical()
+                .id_salt("remote")
+                .auto_shrink([false, false])
+                .max_height(cols[1].available_height() - 40.0)
+                .show(&mut cols[1], |ui| {
+                    for (i, e) in self.remote.iter().enumerate() {
+                        let label = format!(
+                            "{} {}",
+                            if e.is_dir {
+                                "📁"
+                            } else if e.is_symlink {
+                                "🔗"
+                            } else {
+                                "📄"
+                            },
+                            e.name
+                        );
+                        let r = ui.selectable_label(self.sel_remote == Some(i), label);
+                        if r.clicked() {
+                            self.sel_remote = Some(i);
+                        }
+                        if r.double_clicked() && e.is_dir {
+                            go_remote = Some(e.path.clone());
+                        }
+                        r.on_hover_text(format!(
+                            "{}  {}  {}",
+                            e.perms,
+                            human(e.size),
+                            e.modified.map(|m| m.to_string()).unwrap_or_default()
+                        ));
                     }
-                    if r.double_clicked() && e.is_dir {
-                        go_remote = Some(e.path.clone());
-                    }
-                    r.on_hover_text(format!("{}  {}  {}", e.perms, human(e.size), e.modified.map(|m| m.to_string()).unwrap_or_default()));
-                }
-            });
+                });
             if let Some(p) = go_remote {
                 if can_act {
                     self.cd_remote(p);
@@ -302,7 +352,13 @@ impl SftpTab {
         ui.horizontal_wrapped(|ui| {
             let local_sel = self.sel_local.and_then(|i| self.local.get(i).cloned());
             let remote_sel = self.sel_remote.and_then(|i| self.remote.get(i).cloned());
-            if ui.add_enabled(can_act && local_sel.as_ref().map(|l| !l.is_dir).unwrap_or(false), egui::Button::new(RichText::new("Upload ➡").color(accent))).clicked() {
+            if ui
+                .add_enabled(
+                    can_act && local_sel.as_ref().map(|l| !l.is_dir).unwrap_or(false),
+                    egui::Button::new(RichText::new("Upload ➡").color(accent)),
+                )
+                .clicked()
+            {
                 let l = local_sel.clone().unwrap();
                 let remote = sftp::join(&self.remote_cwd, &l.name);
                 let s = self.sftp.clone().unwrap();
@@ -311,10 +367,19 @@ impl SftpTab {
                 let prog = self.progress.clone();
                 let name = l.name.clone();
                 self.spawn(async move {
-                    s.upload(&l.path, &remote, Some(prog)).await.map(|n| format!("Uploaded {name} ({})", human(n))).map_err(|e| e.to_string())
+                    s.upload(&l.path, &remote, Some(prog))
+                        .await
+                        .map(|n| format!("Uploaded {name} ({})", human(n)))
+                        .map_err(|e| e.to_string())
                 });
             }
-            if ui.add_enabled(can_act && remote_sel.as_ref().map(|r| !r.is_dir).unwrap_or(false), egui::Button::new(RichText::new("⬅ Download").color(accent))).clicked() {
+            if ui
+                .add_enabled(
+                    can_act && remote_sel.as_ref().map(|r| !r.is_dir).unwrap_or(false),
+                    egui::Button::new(RichText::new("⬅ Download").color(accent)),
+                )
+                .clicked()
+            {
                 let r = remote_sel.clone().unwrap();
                 let dest = self.local_cwd.join(&r.name);
                 let s = self.sftp.clone().unwrap();
@@ -322,25 +387,58 @@ impl SftpTab {
                 self.total = r.size;
                 let prog = self.progress.clone();
                 self.spawn(async move {
-                    s.download(&r.path, &dest, Some(prog)).await.map(|n| format!("Downloaded {} ({})", r.name, human(n))).map_err(|e| e.to_string())
+                    s.download(&r.path, &dest, Some(prog))
+                        .await
+                        .map(|n| format!("Downloaded {} ({})", r.name, human(n)))
+                        .map_err(|e| e.to_string())
                 });
             }
             ui.separator();
-            ui.add(egui::TextEdit::singleline(&mut self.new_dir).hint_text("new folder").desired_width(120.0));
-            if ui.add_enabled(can_act && !self.new_dir.trim().is_empty(), egui::Button::new("Create")).clicked() {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_dir)
+                    .hint_text("new folder")
+                    .desired_width(120.0),
+            );
+            if ui
+                .add_enabled(
+                    can_act && !self.new_dir.trim().is_empty(),
+                    egui::Button::new("Create"),
+                )
+                .clicked()
+            {
                 let p = sftp::join(&self.remote_cwd, self.new_dir.trim());
                 self.new_dir.clear();
                 let s = self.sftp.clone().unwrap();
-                self.spawn(async move { s.mkdir(&p).await.map(|_| "Folder created".into()).map_err(|e| e.to_string()) });
+                self.spawn(async move {
+                    s.mkdir(&p)
+                        .await
+                        .map(|_| "Folder created".into())
+                        .map_err(|e| e.to_string())
+                });
             }
             ui.separator();
-            ui.add(egui::TextEdit::singleline(&mut self.rename_to).hint_text("rename to").desired_width(120.0));
-            if ui.add_enabled(can_act && remote_sel.is_some() && !self.rename_to.trim().is_empty(), egui::Button::new("Rename")).clicked() {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.rename_to)
+                    .hint_text("rename to")
+                    .desired_width(120.0),
+            );
+            if ui
+                .add_enabled(
+                    can_act && remote_sel.is_some() && !self.rename_to.trim().is_empty(),
+                    egui::Button::new("Rename"),
+                )
+                .clicked()
+            {
                 let r = remote_sel.clone().unwrap();
                 let to = sftp::join(&self.remote_cwd, self.rename_to.trim());
                 self.rename_to.clear();
                 let s = self.sftp.clone().unwrap();
-                self.spawn(async move { s.rename(&r.path, &to).await.map(|_| "Renamed".into()).map_err(|e| e.to_string()) });
+                self.spawn(async move {
+                    s.rename(&r.path, &to)
+                        .await
+                        .map(|_| "Renamed".into())
+                        .map_err(|e| e.to_string())
+                });
             }
             ui.separator();
             if self.confirm_delete {
@@ -350,15 +448,26 @@ impl SftpTab {
                     if let Some(r) = remote_sel.clone() {
                         let s = self.sftp.clone().unwrap();
                         self.spawn(async move {
-                            let res = if r.is_dir && !r.is_symlink { s.remove_tree(&r.path).await } else { s.remove_file(&r.path).await };
-                            res.map(|_| format!("Deleted {}", r.name)).map_err(|e| e.to_string())
+                            let res = if r.is_dir && !r.is_symlink {
+                                s.remove_tree(&r.path).await
+                            } else {
+                                s.remove_file(&r.path).await
+                            };
+                            res.map(|_| format!("Deleted {}", r.name))
+                                .map_err(|e| e.to_string())
                         });
                     }
                 }
                 if ui.button("Cancel").clicked() {
                     self.confirm_delete = false;
                 }
-            } else if ui.add_enabled(can_act && remote_sel.is_some(), egui::Button::new("🗑 Delete")).clicked() {
+            } else if ui
+                .add_enabled(
+                    can_act && remote_sel.is_some(),
+                    egui::Button::new("🗑 Delete"),
+                )
+                .clicked()
+            {
                 self.confirm_delete = true;
             }
         });
@@ -366,7 +475,10 @@ impl SftpTab {
 }
 
 fn dirs_home() -> PathBuf {
-    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[cfg(test)]
