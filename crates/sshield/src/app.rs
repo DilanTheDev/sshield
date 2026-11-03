@@ -7,6 +7,7 @@ use sshield_core::forward::{self, ForwardHandle};
 use sshield_core::ssh::{
     self, Connection, Connector, HostKeyQuery, Interactor, ShellCmd, ShellEvent,
 };
+use sshield_core::sync::{self as csync, SyncConfig};
 use sshield_core::vault::{self, KdfCost, Vault};
 use sshield_core::vpn::{self, VpnManager};
 use sshield_core::*;
@@ -27,6 +28,25 @@ pub struct SessionReady {
     warnings: Vec<String>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SyncMode {
+    /// Pull if the server is ahead (and we have no local edits), push if we have edits.
+    Auto,
+    /// Replace the server copy with ours.
+    Overwrite,
+    /// Replace our copy with the server's.
+    UseServer,
+}
+
+enum SyncMsg {
+    Configured(SyncConfig, Option<u64>),
+    Pushed(u64, u64),
+    Conflict(u64),
+    Downloaded(u64, Vec<u8>),
+    Idle,
+    Err(String),
+}
+
 enum UiMsg {
     HostKey(HostKeyQuery, oneshot::Sender<bool>),
     Secret {
@@ -42,6 +62,7 @@ enum UiMsg {
     Toast(String),
     /// Result of an update check; `manual` checks report "up to date".
     Update(Result<Option<crate::update::Release>, String>, bool),
+    Sync(SyncMsg),
     /// Installer launched (Ok) or failed.
     InstallStarted(Result<(), String>),
 }
@@ -290,6 +311,14 @@ pub struct App {
     toasts: Vec<(String, Instant)>,
     update: Option<crate::update::Release>,
     installing: bool,
+    sync: SyncConfig,
+    sync_busy: bool,
+    sync_gen: u64,
+    sync_conflict: Option<u64>,
+    sync_status: String,
+    sync_url_in: String,
+    sync_acct_in: String,
+    sync_pw_in: String,
     search: String,
     quick: String,
     editor: Option<HostEditor>,
@@ -354,6 +383,14 @@ impl App {
             toasts: vec![],
             update: None,
             installing: false,
+            sync: SyncConfig::default(),
+            sync_busy: false,
+            sync_gen: 0,
+            sync_conflict: None,
+            sync_status: String::new(),
+            sync_url_in: String::new(),
+            sync_acct_in: String::new(),
+            sync_pw_in: String::new(),
             search: String::new(),
             quick: String::new(),
             editor: None,
@@ -397,16 +434,221 @@ impl App {
             return;
         }
         self.dirty = false;
+        let mut saved = false;
         if let Some(v) = &mut self.vault {
             v.set_mirror(
                 (!self.lib.settings.sync_dir.trim().is_empty())
                     .then(|| PathBuf::from(self.lib.settings.sync_dir.trim())),
             );
-            if let Err(e) = v.save(&self.lib) {
-                self.toasts
-                    .push((format!("Saving vault failed: {e}"), Instant::now()));
+            match v.save(&self.lib) {
+                Ok(_) => saved = true,
+                Err(e) => self
+                    .toasts
+                    .push((format!("Saving vault failed: {e}"), Instant::now())),
             }
         }
+        if saved && self.sync.enabled() {
+            self.sync.pending = true;
+            self.sync_gen += 1;
+            let _ = self.sync.save(&self.data_dir);
+            self.sync_run(SyncMode::Auto);
+        }
+    }
+
+    /// Talk to the sync server on a worker thread. Only ciphertext ever leaves this machine.
+    fn sync_run(&mut self, mode: SyncMode) {
+        if self.sync_busy || !self.sync.enabled() {
+            return;
+        }
+        let Some(v) = &self.vault else { return };
+        let bytes = match v.encrypted_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                self.sync_status = format!("Sync: cannot read vault: {e}");
+                return;
+            }
+        };
+        self.sync_busy = true;
+        self.sync_status = "Syncing…".into();
+        let (cfg, tx, ctx, gen) = (
+            self.sync.clone(),
+            self.tx.clone(),
+            self.ctx.clone(),
+            self.sync_gen,
+        );
+        self.rt.spawn_blocking(move || {
+            let r: Result<SyncMsg, String> = (|| {
+                let push = |base: u64, force: bool| -> Result<SyncMsg, String> {
+                    Ok(match csync::push(&cfg, &bytes, base, force)? {
+                        csync::Push::Ok(rev) => SyncMsg::Pushed(rev, gen),
+                        csync::Push::Conflict(rev) => SyncMsg::Conflict(rev),
+                    })
+                };
+                match mode {
+                    SyncMode::Overwrite => push(cfg.rev, true),
+                    SyncMode::UseServer => match csync::pull(&cfg)? {
+                        Some((rev, b)) => Ok(SyncMsg::Downloaded(rev, b)),
+                        None => Err("the server has no vault for this account".into()),
+                    },
+                    SyncMode::Auto => match csync::head(&cfg)? {
+                        Some(r) if r > cfg.rev => {
+                            if cfg.pending {
+                                Ok(SyncMsg::Conflict(r))
+                            } else {
+                                match csync::pull(&cfg)? {
+                                    Some((rev, b)) => Ok(SyncMsg::Downloaded(rev, b)),
+                                    None => Ok(SyncMsg::Idle),
+                                }
+                            }
+                        }
+                        _ if cfg.pending => push(cfg.rev, false),
+                        _ => Ok(SyncMsg::Idle),
+                    },
+                }
+            })();
+            let _ = tx.send(UiMsg::Sync(r.unwrap_or_else(SyncMsg::Err)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn on_sync(&mut self, m: SyncMsg) {
+        if !matches!(m, SyncMsg::Configured(..)) {
+            self.sync_busy = false;
+        }
+        match m {
+            SyncMsg::Configured(cfg, remote) => {
+                self.sync_busy = false;
+                self.sync = cfg;
+                let _ = self.sync.save(&self.data_dir);
+                match remote {
+                    None => {
+                        self.sync.pending = true;
+                        self.sync_run(SyncMode::Auto);
+                    }
+                    Some(r) => {
+                        self.sync_conflict = Some(r);
+                        self.sync_status =
+                            "The server already has a vault for this account.".into();
+                    }
+                }
+            }
+            SyncMsg::Pushed(rev, gen) => {
+                self.sync.rev = rev;
+                self.sync.pending = gen != self.sync_gen;
+                self.sync_conflict = None;
+                let _ = self.sync.save(&self.data_dir);
+                self.sync_status = format!("Synced (revision {rev})");
+                if self.sync.pending {
+                    self.sync_run(SyncMode::Auto);
+                }
+            }
+            SyncMsg::Conflict(r) => {
+                self.sync_conflict = Some(r);
+                self.sync_status =
+                    "Sync conflict: the server has changes from another device.".into();
+            }
+            SyncMsg::Downloaded(rev, bytes) => {
+                let res = self.vault.as_ref().map(|v| {
+                    v.decrypt_remote(&bytes)
+                        .map(|lib| (lib, v.write_raw(&bytes)))
+                });
+                match res {
+                    Some(Ok((lib, w))) => {
+                        if let Err(e) = w {
+                            self.sync_status = format!("Could not write vault: {e}");
+                            return;
+                        }
+                        self.lib = lib;
+                        self.sync.rev = rev;
+                        self.sync.pending = false;
+                        self.sync_conflict = None;
+                        let _ = self.sync.save(&self.data_dir);
+                        self.apply_theme();
+                        self.sync_status = format!("Pulled changes from server (revision {rev})");
+                        self.toast("Synced: loaded the newer vault from the server");
+                    }
+                    Some(Err(vault::VaultError::BadPassword)) => {
+                        self.sync_status = "The server copy uses a different master password (changed on another device). Overwrite it from this device, or install fresh from the lock screen.".into();
+                        self.sync_conflict = Some(rev);
+                    }
+                    Some(Err(e)) => self.sync_status = format!("Server vault unreadable: {e}"),
+                    None => {}
+                }
+            }
+            SyncMsg::Idle => self.sync_status = format!("Synced (revision {})", self.sync.rev),
+            SyncMsg::Err(e) => self.sync_status = format!("Sync error: {e}"),
+        }
+    }
+
+    /// Settings: derive credentials from the master password, then look at what the server has.
+    fn sync_configure(&mut self) {
+        let (url, acct, pw) = (
+            self.sync_url_in.trim().to_string(),
+            self.sync_acct_in.trim().to_string(),
+            std::mem::take(&mut self.sync_pw_in),
+        );
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.sync_busy = true;
+        self.sync_status = "Connecting…".into();
+        self.rt.spawn_blocking(move || {
+            let r = (|| -> Result<SyncMsg, String> {
+                if !url.starts_with("https://") && !url.starts_with("http://localhost") {
+                    return Err("server URL must start with https://".into());
+                }
+                let token = csync::derive_token(&pw, &acct)?;
+                let cfg = SyncConfig {
+                    url,
+                    account: acct,
+                    token,
+                    rev: 0,
+                    pending: false,
+                };
+                let remote = csync::head(&cfg)?;
+                Ok(SyncMsg::Configured(cfg, remote))
+            })();
+            let _ = tx.send(UiMsg::Sync(r.unwrap_or_else(SyncMsg::Err)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Lock screen on a new device: fetch the encrypted vault and adopt it.
+    fn sync_download_new_device(&mut self) {
+        let (url, acct, pw) = (
+            self.sync_url_in.trim().to_string(),
+            self.sync_acct_in.trim().to_string(),
+            self.pw.clone(),
+        );
+        let (path, dir, tx, ctx) = (
+            self.vault_path(),
+            self.data_dir.clone(),
+            self.tx.clone(),
+            self.ctx.clone(),
+        );
+        self.unlocking = true;
+        self.lock_error.clear();
+        self.rt.spawn_blocking(move || {
+            let r = (|| -> Result<(Vault, Library), String> {
+                if !url.starts_with("https://") && !url.starts_with("http://localhost") {
+                    return Err("server URL must start with https://".into());
+                }
+                let token = csync::derive_token(&pw, &acct)?;
+                let mut cfg = SyncConfig {
+                    url,
+                    account: acct,
+                    token,
+                    rev: 0,
+                    pending: false,
+                };
+                let (rev, bytes) =
+                    csync::pull(&cfg)?.ok_or("No vault found on the server for this account.")?;
+                let (v, lib) = Vault::adopt(&path, &bytes, &pw).map_err(|e| e.to_string())?;
+                cfg.rev = rev;
+                cfg.save(&dir).map_err(|e| e.to_string())?;
+                Ok((v, lib))
+            })();
+            let _ = tx.send(UiMsg::Unlocked(r));
+            ctx.request_repaint();
+        });
     }
 
     fn apply_theme(&mut self) {
@@ -481,7 +723,9 @@ impl App {
     }
 
     fn install_update(&mut self) {
-        let Some(rel) = self.update.clone() else { return };
+        let Some(rel) = self.update.clone() else {
+            return;
+        };
         match rel.installer_url {
             Some(url) if cfg!(windows) => {
                 self.installing = true;
@@ -491,7 +735,9 @@ impl App {
                     ctx.request_repaint();
                 });
             }
-            _ => self.ctx.open_url(egui::OpenUrl::new_tab(crate::update::RELEASES_PAGE)),
+            _ => self
+                .ctx
+                .open_url(egui::OpenUrl::new_tab(crate::update::RELEASES_PAGE)),
         }
     }
 
@@ -526,6 +772,9 @@ impl App {
         self.pw2.clear();
         self.show_settings = false;
         self.editor = None;
+        self.sync = SyncConfig::default();
+        self.sync_conflict = None;
+        self.sync_status.clear();
     }
 
     // --------------------------------------------------------- sessions
@@ -730,6 +979,11 @@ impl App {
                             if self.lib.settings.check_updates {
                                 self.check_update(false);
                             }
+                            self.sync = SyncConfig::load(&self.data_dir);
+                            self.sync_conflict = None;
+                            if self.sync.enabled() {
+                                self.sync_run(SyncMode::Auto);
+                            }
                             self.pw.clear();
                             self.pw2.clear();
                             self.applied_font = "\u{0}".into();
@@ -739,6 +993,7 @@ impl App {
                     }
                 }
                 UiMsg::Session { tab, res } => self.on_session(tab, res),
+                UiMsg::Sync(m) => self.on_sync(m),
             }
         }
     }
@@ -989,6 +1244,19 @@ impl App {
                     ui.add_space(6.0);
                     ui.colored_label(c(self.theme.ansi[1]), &self.lock_error);
                 }
+                if !exists {
+                    ui.add_space(14.0);
+                    ui.collapsing("Already use sshield on another device? Download your vault", |ui| {
+                        ui.set_max_width(340.0);
+                        ui.add(egui::TextEdit::singleline(&mut self.sync_url_in).hint_text("Sync server URL (https://…)").desired_width(340.0));
+                        ui.add(egui::TextEdit::singleline(&mut self.sync_acct_in).hint_text("Sync account name").desired_width(340.0));
+                        ui.small("Uses the master password typed above. The vault is decrypted only on this device.");
+                        let ok = !self.unlocking && !self.pw.is_empty() && !self.sync_url_in.trim().is_empty() && !self.sync_acct_in.trim().is_empty();
+                        if ui.add_enabled(ok, egui::Button::new("⬇ Download & unlock")).clicked() {
+                            self.sync_download_new_device();
+                        }
+                    });
+                }
             });
         });
     }
@@ -1224,7 +1492,13 @@ impl App {
                             } else {
                                 format!("⬆ v{} available — open download", rel.version)
                             };
-                            if ui.add_enabled(!self.installing, egui::Button::small(egui::Button::new(label))).clicked() {
+                            if ui
+                                .add_enabled(
+                                    !self.installing,
+                                    egui::Button::small(egui::Button::new(label)),
+                                )
+                                .clicked()
+                            {
                                 self.install_update();
                             }
                         }
@@ -2494,8 +2768,97 @@ impl App {
         );
         ui.small("Mirroring is one-way (this machine → folder); sshield does not merge concurrent edits from two machines.");
         ui.separator();
+        self.settings_sync_server(ui);
+        ui.separator();
         ui.label(format!("Vault file: {}", self.vault_path().display()));
         ui.label(format!("Known hosts: {}", self.known_hosts().display()));
+    }
+
+    fn settings_sync_server(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Sync server (end-to-end encrypted)");
+        ui.label("Your vault is encrypted on this device with your master password before upload; the server only stores ciphertext. Self-host the free Cloudflare Worker in server/cloudflare (see its README).");
+        if self.sync.enabled() {
+            ui.label(format!(
+                "Connected: {} · account “{}”",
+                self.sync.url, self.sync.account
+            ));
+            if !self.sync_status.is_empty() {
+                ui.label(&self.sync_status);
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.sync_busy, egui::Button::new("↻ Sync now"))
+                    .clicked()
+                {
+                    self.sync_run(SyncMode::Auto);
+                }
+                if ui.button("Disconnect").clicked() {
+                    self.sync = SyncConfig::default();
+                    let _ = self.sync.save(&self.data_dir);
+                    self.sync_conflict = None;
+                    self.sync_status.clear();
+                }
+            });
+            if let Some(r) = self.sync_conflict {
+                ui.colored_label(
+                    c(self.theme.ansi[3]),
+                    format!("Server is at revision {r}; choose which copy wins:"),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.sync_busy, egui::Button::new("Use server version"))
+                        .clicked()
+                    {
+                        self.sync_run(SyncMode::UseServer);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.sync_busy,
+                            egui::Button::new("Overwrite server with mine"),
+                        )
+                        .clicked()
+                    {
+                        self.sync_run(SyncMode::Overwrite);
+                    }
+                });
+            }
+        } else {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync_url_in)
+                    .hint_text("Server URL, e.g. https://sshield-sync.you.workers.dev")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync_acct_in)
+                    .hint_text("Account name (any string, same on every device)")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync_pw_in)
+                    .password(true)
+                    .hint_text("Master password (not stored)")
+                    .desired_width(f32::INFINITY),
+            );
+            let ok = !self.sync_busy
+                && !self.sync_url_in.trim().is_empty()
+                && !self.sync_acct_in.trim().is_empty()
+                && !self.sync_pw_in.is_empty();
+            if ui
+                .add_enabled(ok, egui::Button::new("Connect & upload this vault"))
+                .clicked()
+            {
+                self.sync_configure();
+            }
+            if !self.sync_status.is_empty() {
+                ui.label(&self.sync_status);
+            }
+            if let Some(r) = self.sync_conflict {
+                ui.colored_label(c(self.theme.ansi[3]), format!("The server already has a vault (revision {r}). Connecting will not overwrite it silently - set up other devices from their lock screen."));
+            }
+        }
+        if self.sync_busy {
+            ui.spinner();
+        }
     }
 
     fn settings_highlights(&mut self, ui: &mut egui::Ui) {

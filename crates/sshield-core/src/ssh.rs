@@ -71,17 +71,29 @@ pub struct ClientHandler {
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
-    async fn auth_banner(&mut self, banner: &str, _s: &mut client::Session) -> std::result::Result<(), Self::Error> {
+    async fn auth_banner(
+        &mut self,
+        banner: &str,
+        _s: &mut client::Session,
+    ) -> std::result::Result<(), Self::Error> {
         *self.banner.lock().unwrap() = Some(banner.to_string());
         Ok(())
     }
 
-    async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> std::result::Result<bool, Self::Error> {
+    async fn check_server_key(
+        &mut self,
+        key: &PublicKeyOrCertificate,
+    ) -> std::result::Result<bool, Self::Error> {
         let PublicKeyOrCertificate::PublicKey { key, .. } = key else {
             // Host certificates are not supported yet: refuse rather than trust blindly.
             return Ok(false);
         };
-        let changed = match keys::known_hosts::check_known_hosts_path(&self.host, self.port, key, &self.known_hosts) {
+        let changed = match keys::known_hosts::check_known_hosts_path(
+            &self.host,
+            self.port,
+            key,
+            &self.known_hosts,
+        ) {
             Ok(true) => return Ok(true),
             Ok(false) => false,
             Err(russh::keys::Error::KeyChanged { .. }) => true,
@@ -101,7 +113,12 @@ impl client::Handler for ClientHandler {
             // On "changed" the old line stays; the user must clean it up deliberately.
             // We only learn brand-new hosts, so a hijack is never silently overwritten.
             if !changed {
-                let _ = keys::known_hosts::learn_known_hosts_path(&self.host, self.port, key, &self.known_hosts);
+                let _ = keys::known_hosts::learn_known_hosts_path(
+                    &self.host,
+                    self.port,
+                    key,
+                    &self.known_hosts,
+                );
             }
             Ok(true)
         } else {
@@ -136,7 +153,9 @@ impl client::Handler for ClientHandler {
                 });
             }
             None => {
-                let _ = reply.reject(russh::ChannelOpenFailure::AdministrativelyProhibited).await;
+                let _ = reply
+                    .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
             }
         }
         Ok(())
@@ -155,7 +174,10 @@ pub struct Connection {
 
 impl Connection {
     pub async fn disconnect(&self) {
-        let _ = self.handle.disconnect(Disconnect::ByApplication, "bye", "en").await;
+        let _ = self
+            .handle
+            .disconnect(Disconnect::ByApplication, "bye", "en")
+            .await;
     }
 }
 
@@ -178,17 +200,26 @@ pub fn effective_vpn(lib: &Library, host: &Host) -> Result<Option<VpnPolicy>> {
     let configured = vpn::expected_interface(g).is_some();
     match host.require_vpn {
         Some(false) => Ok(None),
-        Some(true) if !(g.enabled || configured) => {
-            Err(msg("this host requires a VPN but no VPN is configured in Settings"))
-        }
-        Some(true) => Ok(Some(VpnPolicy { enabled: true, ..g.clone() })),
+        Some(true) if !(g.enabled || configured) => Err(msg(
+            "this host requires a VPN but no VPN is configured in Settings",
+        )),
+        Some(true) => Ok(Some(VpnPolicy {
+            enabled: true,
+            ..g.clone()
+        })),
         None if g.enabled => Ok(Some(g.clone())),
         None => Ok(None),
     }
 }
 
 impl Connector {
-    pub fn new(lib: &Library, interactor: Arc<dyn Interactor>, vpn: Arc<VpnManager>, known_hosts: PathBuf, host: &Host) -> Result<Self> {
+    pub fn new(
+        lib: &Library,
+        interactor: Arc<dyn Interactor>,
+        vpn: Arc<VpnManager>,
+        known_hosts: PathBuf,
+        host: &Host,
+    ) -> Result<Self> {
         Ok(Connector {
             interactor,
             known_hosts,
@@ -232,35 +263,59 @@ impl Connector {
                 let ch = prev
                     .channel_open_direct_tcpip(h.hostname.clone(), h.port as u32, "127.0.0.1", 0)
                     .await
-                    .map_err(|e| msg(format!("jump host could not reach {}:{}: {e}", h.hostname, h.port)))?;
+                    .map_err(|e| {
+                        msg(format!(
+                            "jump host could not reach {}:{}: {e}",
+                            h.hostname, h.port
+                        ))
+                    })?;
                 parents.push(prev);
-                self.finish_connect(cfg, ch.into_stream(), handler, h).await?
+                self.finish_connect(cfg, ch.into_stream(), handler, h)
+                    .await?
             } else {
                 let tcp = self.first_hop(h).await?;
                 self.finish_connect(cfg, tcp, handler, h).await?
             };
-            self.authenticate(&mut handle, h, i == hops.len() - 1).await?;
+            self.authenticate(&mut handle, h, i == hops.len() - 1)
+                .await?;
             let b = banner.lock().unwrap().clone();
             last = Some((handle, remote_targets, b));
         }
         let (handle, remote_targets, banner) = last.expect("at least one hop");
-        Ok(Connection { handle, label: host.label.clone(), banner, remote_targets, _hops: parents })
+        Ok(Connection {
+            handle,
+            label: host.label.clone(),
+            banner,
+            remote_targets,
+            _hops: parents,
+        })
     }
 
     async fn first_hop(&self, h: &Host) -> Result<TcpStream> {
         let fut = async {
             match &self.vpn_policy {
-                Some(p) => Ok::<_, SshError>(vpn::connect_via(&self.vpn, p, &h.hostname, h.port).await?),
+                Some(p) => {
+                    Ok::<_, SshError>(vpn::connect_via(&self.vpn, p, &h.hostname, h.port).await?)
+                }
                 None => Ok(TcpStream::connect((h.hostname.as_str(), h.port)).await?),
             }
         };
         match tokio::time::timeout(self.connect_timeout, fut).await {
             Ok(r) => r,
-            Err(_) => Err(msg(format!("timed out connecting to {}:{}", h.hostname, h.port))),
+            Err(_) => Err(msg(format!(
+                "timed out connecting to {}:{}",
+                h.hostname, h.port
+            ))),
         }
     }
 
-    async fn finish_connect<S>(&self, cfg: Arc<client::Config>, s: S, handler: ClientHandler, h: &Host) -> Result<Handle<ClientHandler>>
+    async fn finish_connect<S>(
+        &self,
+        cfg: Arc<client::Config>,
+        s: S,
+        handler: ClientHandler,
+        h: &Host,
+    ) -> Result<Handle<ClientHandler>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -281,21 +336,38 @@ impl Connector {
             .map_err(|e| msg(format!("cannot read key '{}': {e}", ident.name)))
     }
 
-    async fn authenticate(&self, handle: &mut Handle<ClientHandler>, h: &Host, _final: bool) -> Result<()> {
-        let fail = || SshError::AuthFailed { user: h.username.clone(), host: h.hostname.clone() };
+    async fn authenticate(
+        &self,
+        handle: &mut Handle<ClientHandler>,
+        h: &Host,
+        _final: bool,
+    ) -> Result<()> {
+        let fail = || SshError::AuthFailed {
+            user: h.username.clone(),
+            host: h.hostname.clone(),
+        };
         let mut kbd_allowed = true;
         let mut try_result = |r: AuthResult| -> Option<bool> {
             match r {
                 AuthResult::Success => Some(true),
-                AuthResult::Failure { remaining_methods, .. } => {
-                    kbd_allowed = remaining_methods.contains(&russh::MethodKind::KeyboardInteractive);
+                AuthResult::Failure {
+                    remaining_methods, ..
+                } => {
+                    kbd_allowed =
+                        remaining_methods.contains(&russh::MethodKind::KeyboardInteractive);
                     None
                 }
             }
         };
         match &h.auth {
             Auth::Password { password } => {
-                if try_result(handle.authenticate_password(&h.username, password.clone()).await?).is_some() {
+                if try_result(
+                    handle
+                        .authenticate_password(&h.username, password.clone())
+                        .await?,
+                )
+                .is_some()
+                {
                     return Ok(());
                 }
             }
@@ -322,7 +394,9 @@ impl Connector {
                             .prompt(format!("Password for {}@{}", h.username, h.hostname), false)
                             .await
                             .ok_or(SshError::Cancelled)?;
-                        if try_result(handle.authenticate_password(&h.username, pw).await?).is_some() {
+                        if try_result(handle.authenticate_password(&h.username, pw).await?)
+                            .is_some()
+                        {
                             return Ok(());
                         }
                     }
@@ -330,13 +404,21 @@ impl Connector {
             }
         }
         // Server wants a second factor / only offers keyboard-interactive.
-        if kbd_allowed && !matches!(h.auth, Auth::Prompt) && self.keyboard_interactive(handle, &h.username).await? {
+        if kbd_allowed
+            && !matches!(h.auth, Auth::Prompt)
+            && self.keyboard_interactive(handle, &h.username).await?
+        {
             return Ok(());
         }
         Err(fail())
     }
 
-    async fn auth_key(&self, handle: &mut Handle<ClientHandler>, user: &str, key: PrivateKey) -> Result<AuthResult> {
+    async fn auth_key(
+        &self,
+        handle: &mut Handle<ClientHandler>,
+        user: &str,
+        key: PrivateKey,
+    ) -> Result<AuthResult> {
         let hash = handle.best_supported_rsa_hash().await?.flatten();
         Ok(handle
             .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
@@ -344,13 +426,23 @@ impl Connector {
     }
 
     /// Returns Ok(true) on success, Ok(false) if the server doesn't do keyboard-interactive / refused.
-    async fn keyboard_interactive(&self, handle: &mut Handle<ClientHandler>, user: &str) -> Result<bool> {
-        let mut resp = handle.authenticate_keyboard_interactive_start(user, None).await?;
+    async fn keyboard_interactive(
+        &self,
+        handle: &mut Handle<ClientHandler>,
+        user: &str,
+    ) -> Result<bool> {
+        let mut resp = handle
+            .authenticate_keyboard_interactive_start(user, None)
+            .await?;
         loop {
             match resp {
                 KeyboardInteractiveAuthResponse::Success => return Ok(true),
                 KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
-                KeyboardInteractiveAuthResponse::InfoRequest { name, instructions, prompts } => {
+                KeyboardInteractiveAuthResponse::InfoRequest {
+                    name,
+                    instructions,
+                    prompts,
+                } => {
                     let mut answers = Vec::with_capacity(prompts.len());
                     for p in &prompts {
                         let mut text = String::new();
@@ -361,9 +453,16 @@ impl Connector {
                             }
                         }
                         text.push_str(&p.prompt);
-                        answers.push(self.interactor.prompt(text, p.echo).await.ok_or(SshError::Cancelled)?);
+                        answers.push(
+                            self.interactor
+                                .prompt(text, p.echo)
+                                .await
+                                .ok_or(SshError::Cancelled)?,
+                        );
                     }
-                    resp = handle.authenticate_keyboard_interactive_respond(answers).await?;
+                    resp = handle
+                        .authenticate_keyboard_interactive_respond(answers)
+                        .await?;
                 }
             }
         }
@@ -392,7 +491,8 @@ pub struct Shell {
 /// Open an interactive shell with a PTY on `conn`.
 pub async fn open_shell(conn: &Connection, host: &Host, cols: u32, rows: u32) -> Result<Shell> {
     let mut ch = conn.handle.channel_open_session().await?;
-    ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[]).await?;
+    ch.request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
+        .await?;
     for (k, v) in &host.env {
         // servers commonly refuse unknown env; ignore the reply
         let _ = ch.set_env(false, k.clone(), v.clone()).await;
@@ -423,7 +523,10 @@ pub async fn open_shell(conn: &Connection, host: &Host, cols: u32, rows: u32) ->
         }
         let _ = ev_tx.send(ShellEvent::Exit(exit));
     });
-    Ok(Shell { tx: cmd_tx, rx: ev_rx })
+    Ok(Shell {
+        tx: cmd_tx,
+        rx: ev_rx,
+    })
 }
 
 #[derive(Debug, Default, Clone)]
@@ -452,7 +555,9 @@ pub async fn exec(conn: &Connection, command: &str) -> Result<ExecOutput> {
 
 /// Fingerprint helper for UIs.
 pub fn fingerprint_of(openssh_pubkey: &str) -> Option<String> {
-    keys::PublicKey::from_openssh(openssh_pubkey).ok().map(|k| k.fingerprint(HashAlg::Sha256).to_string())
+    keys::PublicKey::from_openssh(openssh_pubkey)
+        .ok()
+        .map(|k| k.fingerprint(HashAlg::Sha256).to_string())
 }
 
 /// Generate an Ed25519 key pair; returns (private OpenSSH PEM, public OpenSSH line).
@@ -462,7 +567,12 @@ pub fn generate_ed25519(comment: &str) -> Result<(String, String)> {
     let kp = keys::ssh_key::private::Ed25519Keypair::from_seed(&seed);
     let mut key = PrivateKey::from(kp);
     key.set_comment(comment);
-    let pem = key.to_openssh(keys::ssh_key::LineEnding::LF).map_err(|e| msg(e.to_string()))?;
-    let public = key.public_key().to_openssh().map_err(|e| msg(e.to_string()))?;
+    let pem = key
+        .to_openssh(keys::ssh_key::LineEnding::LF)
+        .map_err(|e| msg(e.to_string()))?;
+    let public = key
+        .public_key()
+        .to_openssh()
+        .map_err(|e| msg(e.to_string()))?;
     Ok((pem.to_string(), public))
 }

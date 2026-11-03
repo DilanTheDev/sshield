@@ -18,17 +18,30 @@ pub fn parse(text: &str) -> Vec<Host> {
             continue;
         }
         let (k, v) = match line.split_once(|c: char| c.is_whitespace() || c == '=') {
-            Some((k, v)) => (k.trim().to_lowercase(), v.trim().trim_start_matches('=').trim().trim_matches('"').to_string()),
+            Some((k, v)) => (
+                k.trim().to_lowercase(),
+                v.trim()
+                    .trim_start_matches('=')
+                    .trim()
+                    .trim_matches('"')
+                    .to_string(),
+            ),
             None => continue,
         };
         if k == "host" {
-            blocks.push(Block { names: v.split_whitespace().map(str::to_string).collect(), kv: vec![] });
+            blocks.push(Block {
+                names: v.split_whitespace().map(str::to_string).collect(),
+                kv: vec![],
+            });
         } else if let Some(b) = blocks.last_mut() {
             b.kv.push((k, v));
         }
     }
-    let defaults: Vec<(String, String)> =
-        blocks.iter().filter(|b| b.names.iter().any(|n| n == "*")).flat_map(|b| b.kv.clone()).collect();
+    let defaults: Vec<(String, String)> = blocks
+        .iter()
+        .filter(|b| b.names.iter().any(|n| n == "*"))
+        .flat_map(|b| b.kv.clone())
+        .collect();
 
     let mut hosts: Vec<Host> = vec![];
     let mut jump_alias: HashMap<String, String> = HashMap::new(); // host id -> alias
@@ -38,7 +51,12 @@ pub fn parse(text: &str) -> Vec<Host> {
                 continue;
             }
             let mut h = Host::new(name, name, &whoami());
-            let get = |key: &str| b.kv.iter().find(|(k, _)| k == key).or_else(|| defaults.iter().find(|(k, _)| k == key)).map(|(_, v)| v.clone());
+            let get = |key: &str| {
+                b.kv.iter()
+                    .find(|(k, _)| k == key)
+                    .or_else(|| defaults.iter().find(|(k, _)| k == key))
+                    .map(|(_, v)| v.clone())
+            };
             if let Some(v) = get("hostname") {
                 h.hostname = v;
             }
@@ -49,7 +67,10 @@ pub fn parse(text: &str) -> Vec<Host> {
                 h.port = p;
             }
             if let Some(f) = get("identityfile") {
-                h.auth = Auth::KeyFile { path: expand_tilde(&f), passphrase: None };
+                h.auth = Auth::KeyFile {
+                    path: expand_tilde(&f),
+                    passphrase: None,
+                };
             }
             if let Some(v) = get("serveraliveinterval").and_then(|v| v.parse().ok()) {
                 h.keepalive_secs = v;
@@ -66,13 +87,19 @@ pub fn parse(text: &str) -> Vec<Host> {
                 }
             }
             if let Some(j) = get("proxyjump") {
-                jump_alias.insert(h.id.clone(), j.split(',').next().unwrap_or("").trim().to_string());
+                jump_alias.insert(
+                    h.id.clone(),
+                    j.split(',').next().unwrap_or("").trim().to_string(),
+                );
             }
             hosts.push(h);
         }
     }
     // resolve jump aliases to ids
-    let by_alias: HashMap<String, String> = hosts.iter().map(|h| (h.label.clone(), h.id.clone())).collect();
+    let by_alias: HashMap<String, String> = hosts
+        .iter()
+        .map(|h| (h.label.clone(), h.id.clone()))
+        .collect();
     for h in &mut hosts {
         if let Some(alias) = jump_alias.get(&h.id) {
             let alias = alias.rsplit('@').next().unwrap_or(alias);
@@ -87,21 +114,38 @@ fn parse_forward(kind: ForwardKind, v: &str) -> Option<PortForward> {
     let mut it = v.split_whitespace();
     let (bind_host, bind_port) = split_hostport(it.next()?, "127.0.0.1")?;
     if kind == ForwardKind::Dynamic {
-        return Some(PortForward { kind, bind_host, bind_port, dest_host: String::new(), dest_port: 0 });
+        return Some(PortForward {
+            kind,
+            bind_host,
+            bind_port,
+            dest_host: String::new(),
+            dest_port: 0,
+        });
     }
     let (dest_host, dest_port) = split_hostport(it.next()?, "127.0.0.1")?;
-    Some(PortForward { kind, bind_host, bind_port, dest_host, dest_port })
+    Some(PortForward {
+        kind,
+        bind_host,
+        bind_port,
+        dest_host,
+        dest_port,
+    })
 }
 
 fn split_hostport(s: &str, default_host: &str) -> Option<(String, u16)> {
     match s.rsplit_once(':') {
-        Some((h, p)) => Some((h.trim_matches(|c| c == '[' || c == ']').to_string(), p.parse().ok()?)),
+        Some((h, p)) => Some((
+            h.trim_matches(|c| c == '[' || c == ']').to_string(),
+            p.parse().ok()?,
+        )),
         None => Some((default_host.to_string(), s.parse().ok()?)),
     }
 }
 
 fn whoami() -> String {
-    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "root".into())
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "root".into())
 }
 
 fn expand_tilde(p: &str) -> String {
@@ -148,9 +192,20 @@ Host *.internal
     User nobody
 "#;
         let hs = parse(cfg);
-        assert_eq!(hs.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(), ["bastion", "db1", "db2"]);
+        assert_eq!(
+            hs.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(),
+            ["bastion", "db1", "db2"]
+        );
         let b = &hs[0];
-        assert_eq!((b.hostname.as_str(), b.port, b.username.as_str(), b.keepalive_secs), ("bastion.example.com", 2222, "deploy", 15));
+        assert_eq!(
+            (
+                b.hostname.as_str(),
+                b.port,
+                b.username.as_str(),
+                b.keepalive_secs
+            ),
+            ("bastion.example.com", 2222, "deploy", 15)
+        );
         assert!(matches!(b.auth, Auth::KeyFile { .. }));
         let d = &hs[1];
         assert_eq!(d.jump.as_deref(), Some(b.id.as_str()));

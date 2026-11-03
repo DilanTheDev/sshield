@@ -18,11 +18,18 @@ pub enum Auth {
     /// Ask every time.
     #[default]
     Prompt,
-    Password { password: String },
+    Password {
+        password: String,
+    },
     /// Reference to an [`Identity`] stored in the library.
-    Identity { id: Id },
+    Identity {
+        id: Id,
+    },
     /// Try `~/.ssh/id_*` style key file on disk.
-    KeyFile { path: String, passphrase: Option<String> },
+    KeyFile {
+        path: String,
+        passphrase: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -202,7 +209,7 @@ impl Default for Settings {
             copy_on_select: true,
             wheel_sends_arrows: false,
             check_updates: true,
-                    cursor_blink: true,
+            cursor_blink: true,
             log_sessions: false,
             log_dir: String::new(),
             vpn: VpnPolicy::default(),
@@ -253,7 +260,9 @@ impl Library {
             if seen.contains(&id) {
                 return Err("jump host cycle detected".into());
             }
-            let h = self.host(&id).ok_or_else(|| format!("jump host {id} not found"))?;
+            let h = self
+                .host(&id)
+                .ok_or_else(|| format!("jump host {id} not found"))?;
             seen.push(id);
             chain.push(h.clone());
             cur = h.jump.clone();
@@ -279,7 +288,12 @@ impl Library {
             return vec![];
         }
         let mut out: Vec<String> = vec![];
-        for c in self.history.iter().rev().chain(self.snippets.iter().map(|s| &s.command)) {
+        for c in self
+            .history
+            .iter()
+            .rev()
+            .chain(self.snippets.iter().map(|s| &s.command))
+        {
             if c.starts_with(prefix) && c != prefix && !out.contains(c) {
                 out.push(c.clone());
                 if out.len() >= limit {
@@ -305,7 +319,10 @@ mod tests {
         let mut lib = Library::default();
         lib.hosts = vec![a.clone(), b.clone(), c.clone()];
         let chain = lib.jump_chain(&c).unwrap();
-        assert_eq!(chain.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(
+            chain.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
         lib.hosts[0].jump = Some(c.id.clone());
         assert!(lib.jump_chain(&c).is_err());
     }

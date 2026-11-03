@@ -15,6 +15,7 @@ pub mod model;
 pub mod sftp;
 pub mod ssh;
 pub mod sshconfig;
+pub mod sync;
 pub mod vault;
 pub mod vpn;
 

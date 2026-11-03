@@ -38,27 +38,56 @@ impl server::Handler for H {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, u: &str, p: &str) -> Result<server::Auth, Self::Error> {
-        Ok(if u == "demo" && p == "demo" { server::Auth::Accept } else { server::Auth::reject() })
+        Ok(if u == "demo" && p == "demo" {
+            server::Auth::Accept
+        } else {
+            server::Auth::reject()
+        })
     }
-    async fn channel_open_session(&mut self, c: Channel<Msg>, r: server::ChannelOpenHandle, _s: &mut Session) -> Result<(), Self::Error> {
+    async fn channel_open_session(
+        &mut self,
+        c: Channel<Msg>,
+        r: server::ChannelOpenHandle,
+        _s: &mut Session,
+    ) -> Result<(), Self::Error> {
         self.chans.insert(c.id(), c);
         r.accept().await;
         Ok(())
     }
-    async fn subsystem_request(&mut self, c: ChannelId, name: &str, s: &mut Session) -> Result<(), Self::Error> {
+    async fn subsystem_request(
+        &mut self,
+        c: ChannelId,
+        name: &str,
+        s: &mut Session,
+    ) -> Result<(), Self::Error> {
         if name == "sftp" {
             if let Some(ch) = self.chans.remove(&c) {
                 s.channel_success(c)?;
-                let root = std::env::var("DEVSERVER_SFTP_ROOT").unwrap_or_else(|_| "/tmp/sshield-devserver-files".into());
+                let root = std::env::var("DEVSERVER_SFTP_ROOT")
+                    .unwrap_or_else(|_| "/tmp/sshield-devserver-files".into());
                 std::fs::create_dir_all(&root).ok();
-                russh_sftp::server::run(ch.into_stream(), sshield_core::devserver::FsSftp::new(root)).await;
+                russh_sftp::server::run(
+                    ch.into_stream(),
+                    sshield_core::devserver::FsSftp::new(root),
+                )
+                .await;
                 return Ok(());
             }
         }
         s.channel_failure(c)?;
         Ok(())
     }
-    async fn pty_request(&mut self, c: ChannelId, _t: &str, w: u32, h: u32, _pw: u32, _ph: u32, _m: &[(russh::Pty, u32)], s: &mut Session) -> Result<(), Self::Error> {
+    async fn pty_request(
+        &mut self,
+        c: ChannelId,
+        _t: &str,
+        w: u32,
+        h: u32,
+        _pw: u32,
+        _ph: u32,
+        _m: &[(russh::Pty, u32)],
+        s: &mut Session,
+    ) -> Result<(), Self::Error> {
         self.size = (w, h);
         s.channel_success(c)?;
         Ok(())
@@ -129,7 +158,15 @@ while True:
         });
         Ok(())
     }
-    async fn window_change_request(&mut self, c: ChannelId, w: u32, h: u32, _pw: u32, _ph: u32, _s: &mut Session) -> Result<(), Self::Error> {
+    async fn window_change_request(
+        &mut self,
+        c: ChannelId,
+        w: u32,
+        h: u32,
+        _pw: u32,
+        _ph: u32,
+        _s: &mut Session,
+    ) -> Result<(), Self::Error> {
         if let Some(i) = self.stdin.get_mut(&c) {
             let mut f = vec![1u8, 0, 4];
             f.extend_from_slice(&(h as u16).to_be_bytes());
@@ -149,7 +186,16 @@ while True:
         }
         Ok(())
     }
-    async fn channel_open_direct_tcpip(&mut self, ch: Channel<Msg>, host: &str, port: u32, _a: &str, _p: u32, reply: server::ChannelOpenHandle, _s: &mut Session) -> Result<(), Self::Error> {
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        ch: Channel<Msg>,
+        host: &str,
+        port: u32,
+        _a: &str,
+        _p: u32,
+        reply: server::ChannelOpenHandle,
+        _s: &mut Session,
+    ) -> Result<(), Self::Error> {
         match TcpStream::connect((host, port as u16)).await {
             Ok(mut sock) => {
                 reply.accept().await;
@@ -174,7 +220,10 @@ async fn main() {
         auth_rejection_time: std::time::Duration::from_millis(100),
         ..Default::default()
     });
-    let port: u16 = std::env::args().nth(1).and_then(|p| p.parse().ok()).unwrap_or(2222);
+    let port: u16 = std::env::args()
+        .nth(1)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(2222);
     let l = TcpListener::bind(("127.0.0.1", port)).await.expect("bind");
     eprintln!("devserver on 127.0.0.1:{port}  user=demo password=demo");
     let _ = Srv.run_on_socket(cfg, &l).await;

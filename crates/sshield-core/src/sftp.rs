@@ -59,7 +59,11 @@ impl Sftp {
                 is_dir: ft.is_dir(),
                 is_symlink: ft.is_symlink(),
                 size: m.len(),
-                modified: m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()),
+                modified: m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()),
                 perms: m.permissions().to_string(),
             });
         }
@@ -67,13 +71,23 @@ impl Sftp {
         Ok(out)
     }
 
-    pub async fn download(&self, remote: &str, local: &Path, progress: Option<Progress>) -> Result<u64> {
+    pub async fn download(
+        &self,
+        remote: &str,
+        local: &Path,
+        progress: Option<Progress>,
+    ) -> Result<u64> {
         let mut src = self.s.open(remote).await.map_err(e)?;
         let mut dst = tokio::fs::File::create(local).await?;
         copy_counted(&mut src, &mut dst, progress).await
     }
 
-    pub async fn upload(&self, local: &Path, remote: &str, progress: Option<Progress>) -> Result<u64> {
+    pub async fn upload(
+        &self,
+        local: &Path,
+        remote: &str,
+        progress: Option<Progress>,
+    ) -> Result<u64> {
         let mut src = tokio::fs::File::open(local).await?;
         let mut dst = self.s.create(remote).await.map_err(e)?;
         let n = copy_counted(&mut src, &mut dst, progress).await?;
@@ -146,7 +160,11 @@ where
 }
 
 pub fn join(dir: &str, name: &str) -> String {
-    if dir.ends_with('/') { format!("{dir}{name}") } else { format!("{dir}/{name}") }
+    if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
 }
 
 /// Parent of a POSIX path ("/" stays "/").
@@ -159,7 +177,11 @@ pub fn parent(path: &str) -> String {
 }
 
 pub fn sort_entries(v: &mut [Entry]) {
-    v.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    v.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
 }
 
 #[cfg(test)]
