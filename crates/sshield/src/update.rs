@@ -22,7 +22,13 @@ fn agent() -> ureq::Agent {
 
 /// Parse "v1.2.3" / "1.2.3-beta" into comparable numbers.
 pub fn parse_version(s: &str) -> Vec<u64> {
-    s.trim_start_matches('v').split(['-', '+']).next().unwrap_or("").split('.').map(|p| p.parse().unwrap_or(0)).collect()
+    s.trim_start_matches('v')
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .map(|p| p.parse().unwrap_or(0))
+        .collect()
 }
 
 pub fn is_newer(candidate: &str, current: &str) -> bool {
@@ -40,14 +46,26 @@ fn release_from_json(v: &serde_json::Value, current: &str) -> Option<Release> {
     }
     let installer_url = v.get("assets")?.as_array()?.iter().find_map(|a| {
         let name = a.get("name")?.as_str()?;
-        name.ends_with("-setup.exe").then(|| a.get("browser_download_url")?.as_str().map(String::from)).flatten()
+        name.ends_with("-setup.exe")
+            .then(|| a.get("browser_download_url")?.as_str().map(String::from))
+            .flatten()
     });
-    Some(Release { version: tag.trim_start_matches('v').to_string(), installer_url })
+    Some(Release {
+        version: tag.trim_start_matches('v').to_string(),
+        installer_url,
+    })
 }
 
 /// Blocking: returns Some(release) when a newer version is published.
 pub fn check() -> Result<Option<Release>, String> {
-    let body = agent().get(LATEST).header("Accept", "application/vnd.github+json").call().map_err(|e| e.to_string())?.into_body().read_to_string().map_err(|e| e.to_string())?;
+    let body = agent()
+        .get(LATEST)
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_body()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     Ok(release_from_json(&v, env!("CARGO_PKG_VERSION")))
 }
@@ -59,10 +77,26 @@ pub fn download_and_run(url: &str) -> Result<(), String> {
         return Err("refusing to download from an unexpected host".into());
     }
     let mut buf = Vec::new();
-    agent().get(url).call().map_err(|e| e.to_string())?.into_body().into_reader().take(200 * 1024 * 1024).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    agent()
+        .get(url)
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_body()
+        .into_reader()
+        .take(200 * 1024 * 1024)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
     let path = std::env::temp_dir().join("sshield-update-setup.exe");
     std::fs::write(&path, buf).map_err(|e| e.to_string())?;
-    std::process::Command::new(&path).args(["/SILENT", "/SP-", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"]).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new(&path)
+        .args([
+            "/SILENT",
+            "/SP-",
+            "/CLOSEAPPLICATIONS",
+            "/RESTARTAPPLICATIONS",
+        ])
+        .spawn()
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -85,7 +119,10 @@ mod tests {
             {"name":"sshield-linux-x64","browser_download_url":"https://x/l"},
             {"name":"sshield-windows-x64-setup.exe","browser_download_url":"https://x/w"}]});
         let r = release_from_json(&j, "0.1.0").unwrap();
-        assert_eq!((r.version.as_str(), r.installer_url.as_deref()), ("0.2.0", Some("https://x/w")));
+        assert_eq!(
+            (r.version.as_str(), r.installer_url.as_deref()),
+            ("0.2.0", Some("https://x/w"))
+        );
         assert!(release_from_json(&j, "0.2.0").is_none());
     }
 }

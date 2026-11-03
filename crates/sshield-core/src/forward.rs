@@ -37,12 +37,21 @@ pub async fn start(conn: Arc<Connection>, spec: PortForward) -> Result<ForwardHa
                 .tcpip_forward(spec.bind_host.clone(), spec.bind_port as u32)
                 .await
                 .map_err(|_| SshError::Msg("server refused remote forward".into()))?;
-            let bound = if port == 0 { spec.bind_port } else { port as u16 };
-            conn.remote_targets
-                .lock()
-                .unwrap()
-                .insert((spec.bind_host.clone(), bound as u32), (spec.dest_host.clone(), spec.dest_port));
-            Ok(ForwardHandle { spec, bound_port: bound, connections, task: None })
+            let bound = if port == 0 {
+                spec.bind_port
+            } else {
+                port as u16
+            };
+            conn.remote_targets.lock().unwrap().insert(
+                (spec.bind_host.clone(), bound as u32),
+                (spec.dest_host.clone(), spec.dest_port),
+            );
+            Ok(ForwardHandle {
+                spec,
+                bound_port: bound,
+                connections,
+                task: None,
+            })
         }
         ForwardKind::Local | ForwardKind::Dynamic => {
             let listener = TcpListener::bind((spec.bind_host.as_str(), spec.bind_port)).await?;
@@ -50,24 +59,47 @@ pub async fn start(conn: Arc<Connection>, spec: PortForward) -> Result<ForwardHa
             let (s2, c2, n2) = (spec.clone(), conn.clone(), connections.clone());
             let task = tokio::spawn(async move {
                 loop {
-                    let Ok((sock, peer)) = listener.accept().await else { break };
+                    let Ok((sock, peer)) = listener.accept().await else {
+                        break;
+                    };
                     let (s, c, n) = (s2.clone(), c2.clone(), n2.clone());
                     tokio::spawn(async move {
                         n.fetch_add(1, Ordering::Relaxed);
                         let _ = match s.kind {
-                            ForwardKind::Local => bridge_local(&c, sock, &s.dest_host, s.dest_port, peer.port()).await,
+                            ForwardKind::Local => {
+                                bridge_local(&c, sock, &s.dest_host, s.dest_port, peer.port()).await
+                            }
                             _ => socks5_serve(&c, sock, peer.port()).await,
                         };
                     });
                 }
             });
-            Ok(ForwardHandle { spec, bound_port, connections, task: Some(task) })
+            Ok(ForwardHandle {
+                spec,
+                bound_port,
+                connections,
+                task: Some(task),
+            })
         }
     }
 }
 
-async fn bridge_local(conn: &Connection, mut sock: TcpStream, host: &str, port: u16, origin_port: u16) -> Result<()> {
-    let ch = conn.handle.channel_open_direct_tcpip(host.to_string(), port as u32, "127.0.0.1", origin_port as u32).await?;
+async fn bridge_local(
+    conn: &Connection,
+    mut sock: TcpStream,
+    host: &str,
+    port: u16,
+    origin_port: u16,
+) -> Result<()> {
+    let ch = conn
+        .handle
+        .channel_open_direct_tcpip(
+            host.to_string(),
+            port as u32,
+            "127.0.0.1",
+            origin_port as u32,
+        )
+        .await?;
     let mut s = ch.into_stream();
     let _ = tokio::io::copy_bidirectional(&mut sock, &mut s).await;
     Ok(())
@@ -96,7 +128,9 @@ impl SocksTarget {
 }
 
 /// Read the SOCKS5 greeting + CONNECT request from `s`. Only "no auth" and CONNECT are supported.
-pub async fn socks5_handshake<S: AsyncReadExt + AsyncWriteExt + Unpin>(s: &mut S) -> std::io::Result<SocksTarget> {
+pub async fn socks5_handshake<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    s: &mut S,
+) -> std::io::Result<SocksTarget> {
     let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
     let mut h = [0u8; 2];
     s.read_exact(&mut h).await?;
@@ -150,7 +184,16 @@ async fn read_port<S: AsyncReadExt + Unpin>(s: &mut S) -> std::io::Result<u16> {
 
 async fn socks5_serve(conn: &Connection, mut sock: TcpStream, origin_port: u16) -> Result<()> {
     let target = socks5_handshake(&mut sock).await?;
-    match conn.handle.channel_open_direct_tcpip(target.host(), target.port() as u32, "127.0.0.1", origin_port as u32).await {
+    match conn
+        .handle
+        .channel_open_direct_tcpip(
+            target.host(),
+            target.port() as u32,
+            "127.0.0.1",
+            origin_port as u32,
+        )
+        .await
+    {
         Ok(ch) => {
             sock.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
             let mut s = ch.into_stream();

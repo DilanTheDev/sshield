@@ -1,0 +1,9 @@
+name = "sshield-sync"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Create the namespace once:  npx wrangler kv namespace create VAULTS
+# then paste the printed id below.
+[[kv_namespaces]]
+binding = "VAULTS"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"

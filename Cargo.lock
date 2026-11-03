@@ -3799,6 +3799,7 @@ name = "sshield"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "dirs",
  "eframe",
  "egui",
  "futures",
@@ -3831,6 +3832,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "toml",
+ "ureq",
  "windows-sys 0.61.2",
  "zeroize",
 ]

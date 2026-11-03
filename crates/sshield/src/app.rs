@@ -7,6 +7,7 @@ use sshield_core::forward::{self, ForwardHandle};
 use sshield_core::ssh::{
     self, Connection, Connector, HostKeyQuery, Interactor, ShellCmd, ShellEvent,
 };
+use sshield_core::sync::{self as csync, SyncConfig};
 use sshield_core::vault::{self, KdfCost, Vault};
 use sshield_core::vpn::{self, VpnManager};
 use sshield_core::*;
@@ -27,6 +28,25 @@ pub struct SessionReady {
     warnings: Vec<String>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SyncMode {
+    /// Pull if the server is ahead (and we have no local edits), push if we have edits.
+    Auto,
+    /// Replace the server copy with ours.
+    Overwrite,
+    /// Replace our copy with the server's.
+    UseServer,
+}
+
+enum SyncMsg {
+    Configured(SyncConfig, Option<u64>),
+    Pushed(u64, u64),
+    Conflict(u64),
+    Downloaded(u64, Vec<u8>),
+    Idle,
+    Err(String),
+}
+
 enum UiMsg {
     HostKey(HostKeyQuery, oneshot::Sender<bool>),
     Secret {
@@ -42,6 +62,9 @@ enum UiMsg {
     Toast(String),
     /// Result of an update check; `manual` checks report "up to date".
     Update(Result<Option<crate::update::Release>, String>, bool),
+    Sync(SyncMsg),
+    ScheduleDone(Id, u64, String),
+    AgentDone(Result<String, String>),
     /// Installer launched (Ok) or failed.
     InstallStarted(Result<(), String>),
 }
@@ -290,12 +313,34 @@ pub struct App {
     toasts: Vec<(String, Instant)>,
     update: Option<crate::update::Release>,
     installing: bool,
+    sync: SyncConfig,
+    sync_busy: bool,
+    sync_gen: u64,
+    sync_conflict: Option<u64>,
+    sync_status: String,
+    sync_url_in: String,
+    sync_acct_in: String,
+    sync_pw_in: String,
     search: String,
     quick: String,
     editor: Option<HostEditor>,
     show_settings: bool,
     settings_tab: SettingsTab,
     show_snippets: bool,
+    show_schedules: bool,
+    show_agent: bool,
+    agent_kind: u8,
+    agent_prompt: String,
+    agent_ctx: bool,
+    agent_out: String,
+    agent_busy: bool,
+    sched_running: Vec<Id>,
+    sched_name: String,
+    sched_host: usize,
+    sched_cmd: String,
+    sched_delay: u32,
+    sched_unit: u8,
+    sched_repeat: bool,
     snippet_draft: (String, String),
     palette: Option<String>,
     broadcast: bool,
@@ -354,12 +399,34 @@ impl App {
             toasts: vec![],
             update: None,
             installing: false,
+            sync: SyncConfig::default(),
+            sync_busy: false,
+            sync_gen: 0,
+            sync_conflict: None,
+            sync_status: String::new(),
+            sync_url_in: String::new(),
+            sync_acct_in: String::new(),
+            sync_pw_in: String::new(),
             search: String::new(),
             quick: String::new(),
             editor: None,
             show_settings: false,
             settings_tab: SettingsTab::General,
             show_snippets: false,
+            show_schedules: false,
+            show_agent: false,
+            agent_kind: 0,
+            agent_prompt: String::new(),
+            agent_ctx: true,
+            agent_out: String::new(),
+            agent_busy: false,
+            sched_running: vec![],
+            sched_name: String::new(),
+            sched_host: 0,
+            sched_cmd: String::new(),
+            sched_delay: 5,
+            sched_unit: 0,
+            sched_repeat: false,
             snippet_draft: Default::default(),
             palette: None,
             broadcast: false,
@@ -397,16 +464,221 @@ impl App {
             return;
         }
         self.dirty = false;
+        let mut saved = false;
         if let Some(v) = &mut self.vault {
             v.set_mirror(
                 (!self.lib.settings.sync_dir.trim().is_empty())
                     .then(|| PathBuf::from(self.lib.settings.sync_dir.trim())),
             );
-            if let Err(e) = v.save(&self.lib) {
-                self.toasts
-                    .push((format!("Saving vault failed: {e}"), Instant::now()));
+            match v.save(&self.lib) {
+                Ok(_) => saved = true,
+                Err(e) => self
+                    .toasts
+                    .push((format!("Saving vault failed: {e}"), Instant::now())),
             }
         }
+        if saved && self.sync.enabled() {
+            self.sync.pending = true;
+            self.sync_gen += 1;
+            let _ = self.sync.save(&self.data_dir);
+            self.sync_run(SyncMode::Auto);
+        }
+    }
+
+    /// Talk to the sync server on a worker thread. Only ciphertext ever leaves this machine.
+    fn sync_run(&mut self, mode: SyncMode) {
+        if self.sync_busy || !self.sync.enabled() {
+            return;
+        }
+        let Some(v) = &self.vault else { return };
+        let bytes = match v.encrypted_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                self.sync_status = format!("Sync: cannot read vault: {e}");
+                return;
+            }
+        };
+        self.sync_busy = true;
+        self.sync_status = "Syncing…".into();
+        let (cfg, tx, ctx, gen) = (
+            self.sync.clone(),
+            self.tx.clone(),
+            self.ctx.clone(),
+            self.sync_gen,
+        );
+        self.rt.spawn_blocking(move || {
+            let r: Result<SyncMsg, String> = (|| {
+                let push = |base: u64, force: bool| -> Result<SyncMsg, String> {
+                    Ok(match csync::push(&cfg, &bytes, base, force)? {
+                        csync::Push::Ok(rev) => SyncMsg::Pushed(rev, gen),
+                        csync::Push::Conflict(rev) => SyncMsg::Conflict(rev),
+                    })
+                };
+                match mode {
+                    SyncMode::Overwrite => push(cfg.rev, true),
+                    SyncMode::UseServer => match csync::pull(&cfg)? {
+                        Some((rev, b)) => Ok(SyncMsg::Downloaded(rev, b)),
+                        None => Err("the server has no vault for this account".into()),
+                    },
+                    SyncMode::Auto => match csync::head(&cfg)? {
+                        Some(r) if r > cfg.rev => {
+                            if cfg.pending {
+                                Ok(SyncMsg::Conflict(r))
+                            } else {
+                                match csync::pull(&cfg)? {
+                                    Some((rev, b)) => Ok(SyncMsg::Downloaded(rev, b)),
+                                    None => Ok(SyncMsg::Idle),
+                                }
+                            }
+                        }
+                        _ if cfg.pending => push(cfg.rev, false),
+                        _ => Ok(SyncMsg::Idle),
+                    },
+                }
+            })();
+            let _ = tx.send(UiMsg::Sync(r.unwrap_or_else(SyncMsg::Err)));
+            ctx.request_repaint();
+        });
+    }
+
+    fn on_sync(&mut self, m: SyncMsg) {
+        if !matches!(m, SyncMsg::Configured(..)) {
+            self.sync_busy = false;
+        }
+        match m {
+            SyncMsg::Configured(cfg, remote) => {
+                self.sync_busy = false;
+                self.sync = cfg;
+                let _ = self.sync.save(&self.data_dir);
+                match remote {
+                    None => {
+                        self.sync.pending = true;
+                        self.sync_run(SyncMode::Auto);
+                    }
+                    Some(r) => {
+                        self.sync_conflict = Some(r);
+                        self.sync_status =
+                            "The server already has a vault for this account.".into();
+                    }
+                }
+            }
+            SyncMsg::Pushed(rev, gen) => {
+                self.sync.rev = rev;
+                self.sync.pending = gen != self.sync_gen;
+                self.sync_conflict = None;
+                let _ = self.sync.save(&self.data_dir);
+                self.sync_status = format!("Synced (revision {rev})");
+                if self.sync.pending {
+                    self.sync_run(SyncMode::Auto);
+                }
+            }
+            SyncMsg::Conflict(r) => {
+                self.sync_conflict = Some(r);
+                self.sync_status =
+                    "Sync conflict: the server has changes from another device.".into();
+            }
+            SyncMsg::Downloaded(rev, bytes) => {
+                let res = self.vault.as_ref().map(|v| {
+                    v.decrypt_remote(&bytes)
+                        .map(|lib| (lib, v.write_raw(&bytes)))
+                });
+                match res {
+                    Some(Ok((lib, w))) => {
+                        if let Err(e) = w {
+                            self.sync_status = format!("Could not write vault: {e}");
+                            return;
+                        }
+                        self.lib = lib;
+                        self.sync.rev = rev;
+                        self.sync.pending = false;
+                        self.sync_conflict = None;
+                        let _ = self.sync.save(&self.data_dir);
+                        self.apply_theme();
+                        self.sync_status = format!("Pulled changes from server (revision {rev})");
+                        self.toast("Synced: loaded the newer vault from the server");
+                    }
+                    Some(Err(vault::VaultError::BadPassword)) => {
+                        self.sync_status = "The server copy uses a different master password (changed on another device). Overwrite it from this device, or install fresh from the lock screen.".into();
+                        self.sync_conflict = Some(rev);
+                    }
+                    Some(Err(e)) => self.sync_status = format!("Server vault unreadable: {e}"),
+                    None => {}
+                }
+            }
+            SyncMsg::Idle => self.sync_status = format!("Synced (revision {})", self.sync.rev),
+            SyncMsg::Err(e) => self.sync_status = format!("Sync error: {e}"),
+        }
+    }
+
+    /// Settings: derive credentials from the master password, then look at what the server has.
+    fn sync_configure(&mut self) {
+        let (url, acct, pw) = (
+            self.sync_url_in.trim().to_string(),
+            self.sync_acct_in.trim().to_string(),
+            std::mem::take(&mut self.sync_pw_in),
+        );
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.sync_busy = true;
+        self.sync_status = "Connecting…".into();
+        self.rt.spawn_blocking(move || {
+            let r = (|| -> Result<SyncMsg, String> {
+                if !url.starts_with("https://") && !url.starts_with("http://localhost") {
+                    return Err("server URL must start with https://".into());
+                }
+                let token = csync::derive_token(&pw, &acct)?;
+                let cfg = SyncConfig {
+                    url,
+                    account: acct,
+                    token,
+                    rev: 0,
+                    pending: false,
+                };
+                let remote = csync::head(&cfg)?;
+                Ok(SyncMsg::Configured(cfg, remote))
+            })();
+            let _ = tx.send(UiMsg::Sync(r.unwrap_or_else(SyncMsg::Err)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Lock screen on a new device: fetch the encrypted vault and adopt it.
+    fn sync_download_new_device(&mut self) {
+        let (url, acct, pw) = (
+            self.sync_url_in.trim().to_string(),
+            self.sync_acct_in.trim().to_string(),
+            self.pw.clone(),
+        );
+        let (path, dir, tx, ctx) = (
+            self.vault_path(),
+            self.data_dir.clone(),
+            self.tx.clone(),
+            self.ctx.clone(),
+        );
+        self.unlocking = true;
+        self.lock_error.clear();
+        self.rt.spawn_blocking(move || {
+            let r = (|| -> Result<(Vault, Library), String> {
+                if !url.starts_with("https://") && !url.starts_with("http://localhost") {
+                    return Err("server URL must start with https://".into());
+                }
+                let token = csync::derive_token(&pw, &acct)?;
+                let mut cfg = SyncConfig {
+                    url,
+                    account: acct,
+                    token,
+                    rev: 0,
+                    pending: false,
+                };
+                let (rev, bytes) =
+                    csync::pull(&cfg)?.ok_or("No vault found on the server for this account.")?;
+                let (v, lib) = Vault::adopt(&path, &bytes, &pw).map_err(|e| e.to_string())?;
+                cfg.rev = rev;
+                cfg.save(&dir).map_err(|e| e.to_string())?;
+                Ok((v, lib))
+            })();
+            let _ = tx.send(UiMsg::Unlocked(r));
+            ctx.request_repaint();
+        });
     }
 
     fn apply_theme(&mut self) {
@@ -481,7 +753,9 @@ impl App {
     }
 
     fn install_update(&mut self) {
-        let Some(rel) = self.update.clone() else { return };
+        let Some(rel) = self.update.clone() else {
+            return;
+        };
         match rel.installer_url {
             Some(url) if cfg!(windows) => {
                 self.installing = true;
@@ -491,7 +765,9 @@ impl App {
                     ctx.request_repaint();
                 });
             }
-            _ => self.ctx.open_url(egui::OpenUrl::new_tab(crate::update::RELEASES_PAGE)),
+            _ => self
+                .ctx
+                .open_url(egui::OpenUrl::new_tab(crate::update::RELEASES_PAGE)),
         }
     }
 
@@ -526,6 +802,9 @@ impl App {
         self.pw2.clear();
         self.show_settings = false;
         self.editor = None;
+        self.sync = SyncConfig::default();
+        self.sync_conflict = None;
+        self.sync_status.clear();
     }
 
     // --------------------------------------------------------- sessions
@@ -730,6 +1009,11 @@ impl App {
                             if self.lib.settings.check_updates {
                                 self.check_update(false);
                             }
+                            self.sync = SyncConfig::load(&self.data_dir);
+                            self.sync_conflict = None;
+                            if self.sync.enabled() {
+                                self.sync_run(SyncMode::Auto);
+                            }
                             self.pw.clear();
                             self.pw2.clear();
                             self.applied_font = "\u{0}".into();
@@ -739,6 +1023,24 @@ impl App {
                     }
                 }
                 UiMsg::Session { tab, res } => self.on_session(tab, res),
+                UiMsg::Sync(m) => self.on_sync(m),
+                UiMsg::AgentDone(r) => {
+                    self.agent_busy = false;
+                    self.agent_out = r.unwrap_or_else(|e| format!("⚠ {e}"));
+                }
+                UiMsg::ScheduleDone(id, at, result) => {
+                    self.sched_running.retain(|x| *x != id);
+                    self.mutate(|l| {
+                        if let Some(s) = l.schedules.iter_mut().find(|s| s.id == id) {
+                            s.last_run = Some(at);
+                            s.last_result = result;
+                            match s.next_after(at) {
+                                Some(t) => s.run_at = t,
+                                None => s.enabled = false,
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -921,6 +1223,7 @@ impl eframe::App for App {
             return;
         }
         self.pump_terminals();
+        self.run_due_schedules();
         self.shortcuts(&ctx);
         self.top_bar(ui);
         self.status_bar(ui);
@@ -988,6 +1291,19 @@ impl App {
                 if !self.lock_error.is_empty() {
                     ui.add_space(6.0);
                     ui.colored_label(c(self.theme.ansi[1]), &self.lock_error);
+                }
+                if !exists {
+                    ui.add_space(14.0);
+                    ui.collapsing("Already use sshield on another device? Download your vault", |ui| {
+                        ui.set_max_width(340.0);
+                        ui.add(egui::TextEdit::singleline(&mut self.sync_url_in).hint_text("Sync server URL (https://…)").desired_width(340.0));
+                        ui.add(egui::TextEdit::singleline(&mut self.sync_acct_in).hint_text("Sync account name").desired_width(340.0));
+                        ui.small("Uses the master password typed above. The vault is decrypted only on this device.");
+                        let ok = !self.unlocking && !self.pw.is_empty() && !self.sync_url_in.trim().is_empty() && !self.sync_acct_in.trim().is_empty();
+                        if ui.add_enabled(ok, egui::Button::new("⬇ Download & unlock")).clicked() {
+                            self.sync_download_new_device();
+                        }
+                    });
                 }
             });
         });
@@ -1151,6 +1467,16 @@ impl App {
                         if ui.button("⚙").on_hover_text("Settings").clicked() {
                             self.show_settings = !self.show_settings;
                         }
+                        if ui
+                            .button("🤖 Agent")
+                            .on_hover_text("Chat with your local Claude Code / Codex CLI")
+                            .clicked()
+                        {
+                            self.show_agent = !self.show_agent;
+                        }
+                        if ui.button("⏰ Schedules").clicked() {
+                            self.show_schedules = !self.show_schedules;
+                        }
                         if ui.button("{ } Snippets").clicked() {
                             self.show_snippets = !self.show_snippets;
                         }
@@ -1224,7 +1550,13 @@ impl App {
                             } else {
                                 format!("⬆ v{} available — open download", rel.version)
                             };
-                            if ui.add_enabled(!self.installing, egui::Button::small(egui::Button::new(label))).clicked() {
+                            if ui
+                                .add_enabled(
+                                    !self.installing,
+                                    egui::Button::small(egui::Button::new(label)),
+                                )
+                                .clicked()
+                            {
                                 self.install_update();
                             }
                         }
@@ -1433,6 +1765,268 @@ impl App {
 
     // ------------------------------------------------------------- home
 
+    /// Fire due schedules (needs the app open and unlocked). Output is stored, truncated.
+    fn run_due_schedules(&mut self) {
+        let t = now();
+        let due: Vec<Schedule> = self
+            .lib
+            .schedules
+            .iter()
+            .filter(|s| s.enabled && s.run_at <= t && !self.sched_running.contains(&s.id))
+            .cloned()
+            .collect();
+        for s in due {
+            let Some(host) = self.lib.hosts.iter().find(|h| h.id == s.host_id).cloned() else {
+                let id = s.id.clone();
+                let _ = self
+                    .tx
+                    .send(UiMsg::ScheduleDone(id, t, "host no longer exists".into()));
+                continue;
+            };
+            let chain = match self.lib.jump_chain(&host) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = self.tx.send(UiMsg::ScheduleDone(s.id.clone(), t, e));
+                    continue;
+                }
+            };
+            let interactor = Arc::new(UiInteractor {
+                tx: self.tx.clone(),
+                ctx: self.ctx.clone(),
+            });
+            let connector = match Connector::new(
+                &self.lib,
+                interactor,
+                self.vpn.clone(),
+                self.known_hosts(),
+                &host,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = self
+                        .tx
+                        .send(UiMsg::ScheduleDone(s.id.clone(), t, e.to_string()));
+                    continue;
+                }
+            };
+            self.sched_running.push(s.id.clone());
+            let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+            self.rt.spawn(async move {
+                let res = async {
+                    let conn = connector
+                        .connect(&host, &chain)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let out = ssh::exec(&conn, &s.command)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    conn.disconnect().await;
+                    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    text.push_str(&String::from_utf8_lossy(&out.stderr));
+                    let text: String = text.chars().take(2000).collect();
+                    Ok::<_, String>(format!(
+                        "exit {}\n{}",
+                        out.code.map(|c| c.to_string()).unwrap_or("?".into()),
+                        text
+                    ))
+                }
+                .await;
+                let _ = tx.send(UiMsg::ScheduleDone(
+                    s.id,
+                    now(),
+                    res.unwrap_or_else(|e| format!("failed: {e}")),
+                ));
+                ctx.request_repaint();
+            });
+        }
+        self.ctx.request_repaint_after(Duration::from_secs(15));
+    }
+
+    /// Text currently on the active terminal's screen (for agent context).
+    fn active_screen_text(&self) -> Option<String> {
+        match self.tabs.get(self.active).map(|t| &t.kind) {
+            Some(TabKind::Term(tt)) => Some(tt.term.parser.screen().contents()),
+            _ => None,
+        }
+    }
+
+    fn agent_window(&mut self, ctx: &egui::Context) {
+        if !self.show_agent {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("🤖 Agent").open(&mut open).default_size([520.0, 480.0]).show(ctx, |ui| {
+            ui.small("Runs your locally installed CLI using your own subscription login (run `claude` or `codex` once in a normal terminal to sign in). Nothing is sent anywhere by sshield itself.");
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("agent_kind").selected_text(["Claude Code", "Codex"][self.agent_kind as usize]).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.agent_kind, 0, "Claude Code (claude -p)");
+                    ui.selectable_value(&mut self.agent_kind, 1, "Codex (codex exec)");
+                });
+                ui.checkbox(&mut self.agent_ctx, "Include the active terminal screen");
+            });
+            ui.add(egui::TextEdit::multiline(&mut self.agent_prompt).hint_text("Ask about the output, an error, or a command…").desired_rows(3).desired_width(f32::INFINITY));
+            ui.horizontal(|ui| {
+                let can = !self.agent_busy && !self.agent_prompt.trim().is_empty();
+                if ui.add_enabled(can, egui::Button::new("Ask")).clicked() {
+                    let mut prompt = String::new();
+                    if self.agent_ctx {
+                        if let Some(t) = self.active_screen_text() {
+                            prompt.push_str("Terminal screen:\n```\n");
+                            prompt.push_str(t.trim_end());
+                            prompt.push_str("\n```\n\n");
+                        }
+                    }
+                    prompt.push_str("Answer concisely. Put any shell command in a fenced code block; do not run anything yourself.\n\n");
+                    prompt.push_str(self.agent_prompt.trim());
+                    self.agent_busy = true;
+                    self.agent_out.clear();
+                    let (tx, ctx2, kind) = (self.tx.clone(), self.ctx.clone(), self.agent_kind);
+                    self.rt.spawn_blocking(move || {
+                        let _ = tx.send(UiMsg::AgentDone(run_agent(kind, &prompt)));
+                        ctx2.request_repaint();
+                    });
+                }
+                if self.agent_busy {
+                    ui.spinner();
+                    ui.label("thinking…");
+                }
+            });
+            ui.separator();
+            if let Some(cmd) = first_code_block(&self.agent_out) {
+                ui.horizontal(|ui| {
+                    if ui.button("⏎ Insert command into terminal (not run)").on_hover_text("Types the command at the prompt; you press Enter yourself").clicked() {
+                        self.send_to_active(cmd.as_bytes());
+                    }
+                    if ui.button("Copy").clicked() {
+                        ctx.copy_text(cmd.clone());
+                    }
+                });
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add(egui::Label::new(&self.agent_out).selectable(true));
+            });
+        });
+        if !open {
+            self.show_agent = false;
+        }
+    }
+
+    fn schedules_window(&mut self, ctx: &egui::Context) {
+        if !self.show_schedules {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Schedules").open(&mut open).default_width(560.0).show(ctx, |ui| {
+            ui.small("Runs a command on a host at a set time. sshield must be open and unlocked; hosts that ask for a password each time will prompt.");
+            let mut remove: Option<usize> = None;
+            let mut toggle: Option<usize> = None;
+            let t = now();
+            for (i, s) in self.lib.schedules.iter().enumerate() {
+                let host = self.lib.hosts.iter().find(|h| h.id == s.host_id).map(|h| h.label.clone()).unwrap_or("(deleted host)".into());
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(&s.name);
+                        ui.label(format!("on {host}"));
+                        let when = if !s.enabled { "finished/paused".to_string() } else if s.run_at <= t { "due now".to_string() } else { format!("in {}", fmt_dur(Duration::from_secs(s.run_at - t))) };
+                        ui.label(when);
+                        if s.repeat_secs > 0 {
+                            ui.label(format!("every {}", fmt_dur(Duration::from_secs(s.repeat_secs))));
+                        }
+                        if ui.small_button(if s.enabled { "Pause" } else { "Enable" }).clicked() {
+                            toggle = Some(i);
+                        }
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    ui.monospace(&s.command);
+                    if !s.last_result.is_empty() {
+                        ui.collapsing("Last result", |ui| ui.monospace(&s.last_result));
+                    }
+                });
+            }
+            if let Some(i) = toggle {
+                self.mutate(|l| {
+                    let s = &mut l.schedules[i];
+                    s.enabled = !s.enabled;
+                    if s.enabled && s.run_at <= t {
+                        s.run_at = t + 5;
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                self.mutate(|l| {
+                    l.schedules.remove(i);
+                });
+            }
+            ui.separator();
+            ui.strong("New schedule");
+            ui.add(egui::TextEdit::singleline(&mut self.sched_name).hint_text("Name, e.g. nightly backup").desired_width(f32::INFINITY));
+            let labels: Vec<String> = self.lib.hosts.iter().map(|h| h.label.clone()).collect();
+            if self.sched_host >= labels.len() {
+                self.sched_host = 0;
+            }
+            egui::ComboBox::from_label("Host").selected_text(labels.get(self.sched_host).cloned().unwrap_or_default()).show_ui(ui, |ui| {
+                for (i, l) in labels.iter().enumerate() {
+                    ui.selectable_value(&mut self.sched_host, i, l);
+                }
+            });
+            ui.add(egui::TextEdit::singleline(&mut self.sched_cmd).hint_text("Command, e.g. sudo apt-get update").desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
+            ui.horizontal(|ui| {
+                ui.label("Run in");
+                ui.add(egui::DragValue::new(&mut self.sched_delay).range(1..=999));
+                egui::ComboBox::from_id_salt("sched_unit").selected_text(["minutes", "hours", "days"][self.sched_unit as usize]).show_ui(ui, |ui| {
+                    for (i, n) in ["minutes", "hours", "days"].iter().enumerate() {
+                        ui.selectable_value(&mut self.sched_unit, i as u8, *n);
+                    }
+                });
+                ui.checkbox(&mut self.sched_repeat, "repeat at that interval");
+            });
+            let ok = !self.sched_cmd.trim().is_empty() && !labels.is_empty();
+            if ui.add_enabled(ok, egui::Button::new("Add schedule")).clicked() {
+                let secs = self.sched_delay as u64 * [60u64, 3600, 86400][self.sched_unit as usize];
+                let host_id = self.lib.hosts[self.sched_host].id.clone();
+                let sc = Schedule {
+                    id: new_id(),
+                    name: if self.sched_name.trim().is_empty() { self.sched_cmd.chars().take(24).collect() } else { self.sched_name.trim().to_string() },
+                    host_id,
+                    command: self.sched_cmd.trim().to_string(),
+                    run_at: t + secs,
+                    repeat_secs: if self.sched_repeat { secs } else { 0 },
+                    enabled: true,
+                    last_run: None,
+                    last_result: String::new(),
+                };
+                self.mutate(|l| l.schedules.push(sc));
+                self.sched_cmd.clear();
+                self.sched_name.clear();
+            }
+        });
+        if !open {
+            self.show_schedules = false;
+        }
+    }
+
+    fn export_hosts(&mut self, kind: &str, text: String) {
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| self.data_dir.clone());
+        let name = if kind == "json" {
+            "sshield-hosts.json"
+        } else {
+            "sshield-ssh_config"
+        };
+        let path = dir.join(name);
+        match std::fs::write(&path, text) {
+            Ok(_) => self.toast(format!(
+                "Exported {} hosts to {}",
+                self.lib.hosts.len(),
+                path.display()
+            )),
+            Err(e) => self.toast(format!("Export failed: {e}")),
+        }
+    }
+
     fn home(&mut self, ui: &mut egui::Ui) {
         let mut actions: Vec<Action> = vec![];
         ui.horizontal(|ui| {
@@ -1460,6 +2054,22 @@ impl App {
                 h.group = String::new();
                 self.editor = Some(HostEditor::new(h, true));
             }
+            ui.menu_button("⬇ Export hosts", |ui| {
+                ui.small("Passwords and passphrases are never exported.");
+                if ui.button("JSON (re-importable backup)").clicked() {
+                    self.export_hosts("json", export::hosts_json(&self.lib));
+                    ui.close();
+                }
+                if ui.button("OpenSSH config").clicked() {
+                    self.export_hosts("ssh_config", export::ssh_config(&self.lib));
+                    ui.close();
+                }
+                if ui.button("Copy JSON to clipboard").clicked() {
+                    ui.ctx().copy_text(export::hosts_json(&self.lib));
+                    self.toast("Hosts copied to clipboard");
+                    ui.close();
+                }
+            });
             if ui.button("Import ~/.ssh/config").clicked() {
                 let imported = sshconfig::import_default();
                 let existing: Vec<String> = self
@@ -1583,6 +2193,8 @@ impl App {
         self.host_editor_window(ctx);
         self.snippets_window(ctx);
         self.palette_window(ctx);
+        self.schedules_window(ctx);
+        self.agent_window(ctx);
         self.settings_window(ctx);
         if let Some(id) = self.confirm_delete.clone() {
             let name = self
@@ -2494,8 +3106,97 @@ impl App {
         );
         ui.small("Mirroring is one-way (this machine → folder); sshield does not merge concurrent edits from two machines.");
         ui.separator();
+        self.settings_sync_server(ui);
+        ui.separator();
         ui.label(format!("Vault file: {}", self.vault_path().display()));
         ui.label(format!("Known hosts: {}", self.known_hosts().display()));
+    }
+
+    fn settings_sync_server(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Sync server (end-to-end encrypted)");
+        ui.label("Your vault is encrypted on this device with your master password before upload; the server only stores ciphertext. Self-host the free Cloudflare Worker in server/cloudflare (see its README).");
+        if self.sync.enabled() {
+            ui.label(format!(
+                "Connected: {} · account “{}”",
+                self.sync.url, self.sync.account
+            ));
+            if !self.sync_status.is_empty() {
+                ui.label(&self.sync_status);
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.sync_busy, egui::Button::new("↻ Sync now"))
+                    .clicked()
+                {
+                    self.sync_run(SyncMode::Auto);
+                }
+                if ui.button("Disconnect").clicked() {
+                    self.sync = SyncConfig::default();
+                    let _ = self.sync.save(&self.data_dir);
+                    self.sync_conflict = None;
+                    self.sync_status.clear();
+                }
+            });
+            if let Some(r) = self.sync_conflict {
+                ui.colored_label(
+                    c(self.theme.ansi[3]),
+                    format!("Server is at revision {r}; choose which copy wins:"),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!self.sync_busy, egui::Button::new("Use server version"))
+                        .clicked()
+                    {
+                        self.sync_run(SyncMode::UseServer);
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.sync_busy,
+                            egui::Button::new("Overwrite server with mine"),
+                        )
+                        .clicked()
+                    {
+                        self.sync_run(SyncMode::Overwrite);
+                    }
+                });
+            }
+        } else {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync_url_in)
+                    .hint_text("Server URL, e.g. https://sshield-sync.you.workers.dev")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync_acct_in)
+                    .hint_text("Account name (any string, same on every device)")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync_pw_in)
+                    .password(true)
+                    .hint_text("Master password (not stored)")
+                    .desired_width(f32::INFINITY),
+            );
+            let ok = !self.sync_busy
+                && !self.sync_url_in.trim().is_empty()
+                && !self.sync_acct_in.trim().is_empty()
+                && !self.sync_pw_in.is_empty();
+            if ui
+                .add_enabled(ok, egui::Button::new("Connect & upload this vault"))
+                .clicked()
+            {
+                self.sync_configure();
+            }
+            if !self.sync_status.is_empty() {
+                ui.label(&self.sync_status);
+            }
+            if let Some(r) = self.sync_conflict {
+                ui.colored_label(c(self.theme.ansi[3]), format!("The server already has a vault (revision {r}). Connecting will not overwrite it silently - set up other devices from their lock screen."));
+            }
+        }
+        if self.sync_busy {
+            ui.spinner();
+        }
     }
 
     fn settings_highlights(&mut self, ui: &mut egui::Ui) {
@@ -2652,6 +3353,61 @@ fn host_grid(
         });
 }
 
+/// Run the local agent CLI non-interactively; the prompt goes via stdin.
+fn run_agent(kind: u8, prompt: &str) -> Result<String, String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let (bin, args): (&str, &[&str]) = if kind == 0 {
+        ("claude", &["-p"])
+    } else {
+        ("codex", &["exec", "-"])
+    };
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", bin]);
+        c
+    } else {
+        Command::new(bin)
+    };
+    let mut child = cmd
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start `{bin}` ({e}). Install it and sign in first."))?;
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(prompt.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() && !text.is_empty() {
+        Ok(text)
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(format!(
+            "`{bin}` failed: {}{}",
+            err.trim(),
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("\n{text}")
+            }
+        ))
+    }
+}
+
+/// Body of the first ``` fenced block, if any.
+fn first_code_block(text: &str) -> Option<String> {
+    let start = text.find("```")?;
+    let rest = &text[start + 3..];
+    let nl = rest.find('\n')?;
+    let body = &rest[nl + 1..];
+    let end = body.find("```")?;
+    let code = body[..end].trim_end();
+    (!code.is_empty()).then(|| code.to_string())
+}
+
 fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     if s >= 3600 {
@@ -2670,6 +3426,15 @@ fn fuzzy(needle: &str, hay: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_code_block() {
+        assert_eq!(
+            first_code_block("run:\n```bash\nls -la\n```\nok").as_deref(),
+            Some("ls -la")
+        );
+        assert_eq!(first_code_block("no code"), None);
+    }
 
     #[test]
     fn fuzzy_matching() {

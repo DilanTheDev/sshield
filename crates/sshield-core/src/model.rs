@@ -18,11 +18,18 @@ pub enum Auth {
     /// Ask every time.
     #[default]
     Prompt,
-    Password { password: String },
+    Password {
+        password: String,
+    },
     /// Reference to an [`Identity`] stored in the library.
-    Identity { id: Id },
+    Identity {
+        id: Id,
+    },
     /// Try `~/.ssh/id_*` style key file on disk.
-    KeyFile { path: String, passphrase: Option<String> },
+    KeyFile {
+        path: String,
+        passphrase: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -202,7 +209,7 @@ impl Default for Settings {
             copy_on_select: true,
             wheel_sends_arrows: false,
             check_updates: true,
-                    cursor_blink: true,
+            cursor_blink: true,
             log_sessions: false,
             log_dir: String::new(),
             vpn: VpnPolicy::default(),
@@ -219,6 +226,38 @@ impl Default for Settings {
     }
 }
 
+/// A command to run on a host at a point in time (optionally repeating).
+/// Runs only while sshield is open and unlocked.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Schedule {
+    pub id: Id,
+    pub name: String,
+    pub host_id: Id,
+    pub command: String,
+    /// Next run, unix seconds.
+    pub run_at: u64,
+    /// 0 = run once.
+    pub repeat_secs: u64,
+    pub enabled: bool,
+    pub last_run: Option<u64>,
+    pub last_result: String,
+}
+
+impl Schedule {
+    /// Next run time after a run that happened at `now` (None = finished).
+    pub fn next_after(&self, now: u64) -> Option<u64> {
+        if self.repeat_secs == 0 {
+            return None;
+        }
+        let mut t = self.run_at + self.repeat_secs;
+        if t <= now {
+            // skip missed slots (app was closed) instead of firing a burst
+            t += ((now - t) / self.repeat_secs + 1) * self.repeat_secs;
+        }
+        Some(t)
+    }
+}
+
 /// The whole user library. This is the plaintext that gets encrypted.
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
@@ -226,6 +265,7 @@ pub struct Library {
     pub hosts: Vec<Host>,
     pub identities: Vec<Identity>,
     pub snippets: Vec<Snippet>,
+    pub schedules: Vec<Schedule>,
     pub settings: Settings,
     /// Command history for autocompletion (most recent last).
     pub history: Vec<String>,
@@ -253,7 +293,9 @@ impl Library {
             if seen.contains(&id) {
                 return Err("jump host cycle detected".into());
             }
-            let h = self.host(&id).ok_or_else(|| format!("jump host {id} not found"))?;
+            let h = self
+                .host(&id)
+                .ok_or_else(|| format!("jump host {id} not found"))?;
             seen.push(id);
             chain.push(h.clone());
             cur = h.jump.clone();
@@ -279,7 +321,12 @@ impl Library {
             return vec![];
         }
         let mut out: Vec<String> = vec![];
-        for c in self.history.iter().rev().chain(self.snippets.iter().map(|s| &s.command)) {
+        for c in self
+            .history
+            .iter()
+            .rev()
+            .chain(self.snippets.iter().map(|s| &s.command))
+        {
             if c.starts_with(prefix) && c != prefix && !out.contains(c) {
                 out.push(c.clone());
                 if out.len() >= limit {
@@ -288,6 +335,30 @@ impl Library {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    #[test]
+    fn next_run_skips_missed_slots() {
+        let mut s = Schedule {
+            id: new_id(),
+            name: "n".into(),
+            host_id: new_id(),
+            command: "x".into(),
+            run_at: 1000,
+            repeat_secs: 100,
+            enabled: true,
+            last_run: None,
+            last_result: String::new(),
+        };
+        assert_eq!(s.next_after(1000), Some(1100));
+        assert_eq!(s.next_after(1450), Some(1500));
+        s.repeat_secs = 0;
+        assert_eq!(s.next_after(1000), None);
     }
 }
 
@@ -305,7 +376,10 @@ mod tests {
         let mut lib = Library::default();
         lib.hosts = vec![a.clone(), b.clone(), c.clone()];
         let chain = lib.jump_chain(&c).unwrap();
-        assert_eq!(chain.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(
+            chain.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
         lib.hosts[0].jump = Some(c.id.clone());
         assert!(lib.jump_chain(&c).is_err());
     }
