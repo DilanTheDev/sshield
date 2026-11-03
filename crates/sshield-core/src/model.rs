@@ -226,6 +226,38 @@ impl Default for Settings {
     }
 }
 
+/// A command to run on a host at a point in time (optionally repeating).
+/// Runs only while sshield is open and unlocked.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Schedule {
+    pub id: Id,
+    pub name: String,
+    pub host_id: Id,
+    pub command: String,
+    /// Next run, unix seconds.
+    pub run_at: u64,
+    /// 0 = run once.
+    pub repeat_secs: u64,
+    pub enabled: bool,
+    pub last_run: Option<u64>,
+    pub last_result: String,
+}
+
+impl Schedule {
+    /// Next run time after a run that happened at `now` (None = finished).
+    pub fn next_after(&self, now: u64) -> Option<u64> {
+        if self.repeat_secs == 0 {
+            return None;
+        }
+        let mut t = self.run_at + self.repeat_secs;
+        if t <= now {
+            // skip missed slots (app was closed) instead of firing a burst
+            t += ((now - t) / self.repeat_secs + 1) * self.repeat_secs;
+        }
+        Some(t)
+    }
+}
+
 /// The whole user library. This is the plaintext that gets encrypted.
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
@@ -233,6 +265,7 @@ pub struct Library {
     pub hosts: Vec<Host>,
     pub identities: Vec<Identity>,
     pub snippets: Vec<Snippet>,
+    pub schedules: Vec<Schedule>,
     pub settings: Settings,
     /// Command history for autocompletion (most recent last).
     pub history: Vec<String>,
@@ -302,6 +335,30 @@ impl Library {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::*;
+
+    #[test]
+    fn next_run_skips_missed_slots() {
+        let mut s = Schedule {
+            id: new_id(),
+            name: "n".into(),
+            host_id: new_id(),
+            command: "x".into(),
+            run_at: 1000,
+            repeat_secs: 100,
+            enabled: true,
+            last_run: None,
+            last_result: String::new(),
+        };
+        assert_eq!(s.next_after(1000), Some(1100));
+        assert_eq!(s.next_after(1450), Some(1500));
+        s.repeat_secs = 0;
+        assert_eq!(s.next_after(1000), None);
     }
 }
 

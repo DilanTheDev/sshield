@@ -11,28 +11,50 @@ pub fn hosts_json(lib: &Library) -> String {
         .map(|mut h| {
             h.auth = match h.auth {
                 Auth::Password { .. } => Auth::Prompt,
-                Auth::KeyFile { path, .. } => Auth::KeyFile { path, passphrase: None },
+                Auth::KeyFile { path, .. } => Auth::KeyFile {
+                    path,
+                    passphrase: None,
+                },
                 other => other,
             };
             h
         })
         .collect();
-    serde_json::to_string_pretty(&serde_json::json!({ "sshield_export": 1, "hosts": hosts })).unwrap_or_default()
+    serde_json::to_string_pretty(&serde_json::json!({ "sshield_export": 1, "hosts": hosts }))
+        .unwrap_or_default()
 }
 
 fn alias(h: &Host) -> String {
-    let a: String = (if h.label.is_empty() { &h.hostname } else { &h.label })
-        .chars()
-        .map(|c| if c.is_whitespace() || c == '*' || c == '?' || c == '!' { '-' } else { c })
-        .collect();
-    if a.is_empty() { "host".into() } else { a }
+    let a: String = (if h.label.is_empty() {
+        &h.hostname
+    } else {
+        &h.label
+    })
+    .chars()
+    .map(|c| {
+        if c.is_whitespace() || c == '*' || c == '?' || c == '!' {
+            '-'
+        } else {
+            c
+        }
+    })
+    .collect();
+    if a.is_empty() {
+        "host".into()
+    } else {
+        a
+    }
 }
 
 /// OpenSSH client config for all hosts (jump hosts become `ProxyJump`).
 pub fn ssh_config(lib: &Library) -> String {
     let mut out = String::from("# Exported from sshield\n");
     for h in &lib.hosts {
-        out.push_str(&format!("\nHost {}\n    HostName {}\n", alias(h), h.hostname));
+        out.push_str(&format!(
+            "\nHost {}\n    HostName {}\n",
+            alias(h),
+            h.hostname
+        ));
         if !h.username.is_empty() {
             out.push_str(&format!("    User {}\n", h.username));
         }
@@ -42,7 +64,11 @@ pub fn ssh_config(lib: &Library) -> String {
         if let Auth::KeyFile { path, .. } = &h.auth {
             out.push_str(&format!("    IdentityFile {path}\n"));
         }
-        if let Some(j) = h.jump.as_ref().and_then(|id| lib.hosts.iter().find(|x| &x.id == id)) {
+        if let Some(j) = h
+            .jump
+            .as_ref()
+            .and_then(|id| lib.hosts.iter().find(|x| &x.id == id))
+        {
             out.push_str(&format!("    ProxyJump {}\n", alias(j)));
         }
         if h.keepalive_secs > 0 {
@@ -62,12 +88,16 @@ mod tests {
         let jump = Host::new("bastion", "b.example.com", "ops");
         let mut h = Host::new("web 1", "10.0.0.5", "root");
         h.port = 2222;
-        h.auth = Auth::Password { password: "hunter2".into() };
+        h.auth = Auth::Password {
+            password: "hunter2".into(),
+        };
         h.jump = Some(jump.id.clone());
         lib.hosts = vec![jump, h];
         let j = hosts_json(&lib);
         assert!(!j.contains("hunter2"));
         let c = ssh_config(&lib);
-        assert!(c.contains("Host web-1") && c.contains("Port 2222") && c.contains("ProxyJump bastion"));
+        assert!(
+            c.contains("Host web-1") && c.contains("Port 2222") && c.contains("ProxyJump bastion")
+        );
     }
 }

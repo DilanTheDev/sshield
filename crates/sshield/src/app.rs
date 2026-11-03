@@ -63,6 +63,7 @@ enum UiMsg {
     /// Result of an update check; `manual` checks report "up to date".
     Update(Result<Option<crate::update::Release>, String>, bool),
     Sync(SyncMsg),
+    ScheduleDone(Id, u64, String),
     /// Installer launched (Ok) or failed.
     InstallStarted(Result<(), String>),
 }
@@ -325,6 +326,14 @@ pub struct App {
     show_settings: bool,
     settings_tab: SettingsTab,
     show_snippets: bool,
+    show_schedules: bool,
+    sched_running: Vec<Id>,
+    sched_name: String,
+    sched_host: usize,
+    sched_cmd: String,
+    sched_delay: u32,
+    sched_unit: u8,
+    sched_repeat: bool,
     snippet_draft: (String, String),
     palette: Option<String>,
     broadcast: bool,
@@ -397,6 +406,14 @@ impl App {
             show_settings: false,
             settings_tab: SettingsTab::General,
             show_snippets: false,
+            show_schedules: false,
+            sched_running: vec![],
+            sched_name: String::new(),
+            sched_host: 0,
+            sched_cmd: String::new(),
+            sched_delay: 5,
+            sched_unit: 0,
+            sched_repeat: false,
             snippet_draft: Default::default(),
             palette: None,
             broadcast: false,
@@ -994,6 +1011,19 @@ impl App {
                 }
                 UiMsg::Session { tab, res } => self.on_session(tab, res),
                 UiMsg::Sync(m) => self.on_sync(m),
+                UiMsg::ScheduleDone(id, at, result) => {
+                    self.sched_running.retain(|x| *x != id);
+                    self.mutate(|l| {
+                        if let Some(s) = l.schedules.iter_mut().find(|s| s.id == id) {
+                            s.last_run = Some(at);
+                            s.last_result = result;
+                            match s.next_after(at) {
+                                Some(t) => s.run_at = t,
+                                None => s.enabled = false,
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -1176,6 +1206,7 @@ impl eframe::App for App {
             return;
         }
         self.pump_terminals();
+        self.run_due_schedules();
         self.shortcuts(&ctx);
         self.top_bar(ui);
         self.status_bar(ui);
@@ -1418,6 +1449,9 @@ impl App {
                         }
                         if ui.button("⚙").on_hover_text("Settings").clicked() {
                             self.show_settings = !self.show_settings;
+                        }
+                        if ui.button("⏰ Schedules").clicked() {
+                            self.show_schedules = !self.show_schedules;
                         }
                         if ui.button("{ } Snippets").clicked() {
                             self.show_snippets = !self.show_snippets;
@@ -1707,12 +1741,195 @@ impl App {
 
     // ------------------------------------------------------------- home
 
+    /// Fire due schedules (needs the app open and unlocked). Output is stored, truncated.
+    fn run_due_schedules(&mut self) {
+        let t = now();
+        let due: Vec<Schedule> = self
+            .lib
+            .schedules
+            .iter()
+            .filter(|s| s.enabled && s.run_at <= t && !self.sched_running.contains(&s.id))
+            .cloned()
+            .collect();
+        for s in due {
+            let Some(host) = self.lib.hosts.iter().find(|h| h.id == s.host_id).cloned() else {
+                let id = s.id.clone();
+                let _ = self
+                    .tx
+                    .send(UiMsg::ScheduleDone(id, t, "host no longer exists".into()));
+                continue;
+            };
+            let chain = match self.lib.jump_chain(&host) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = self.tx.send(UiMsg::ScheduleDone(s.id.clone(), t, e));
+                    continue;
+                }
+            };
+            let interactor = Arc::new(UiInteractor {
+                tx: self.tx.clone(),
+                ctx: self.ctx.clone(),
+            });
+            let connector = match Connector::new(
+                &self.lib,
+                interactor,
+                self.vpn.clone(),
+                self.known_hosts(),
+                &host,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = self
+                        .tx
+                        .send(UiMsg::ScheduleDone(s.id.clone(), t, e.to_string()));
+                    continue;
+                }
+            };
+            self.sched_running.push(s.id.clone());
+            let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+            self.rt.spawn(async move {
+                let res = async {
+                    let conn = connector
+                        .connect(&host, &chain)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let out = ssh::exec(&conn, &s.command)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    conn.disconnect().await;
+                    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    text.push_str(&String::from_utf8_lossy(&out.stderr));
+                    let text: String = text.chars().take(2000).collect();
+                    Ok::<_, String>(format!(
+                        "exit {}\n{}",
+                        out.code.map(|c| c.to_string()).unwrap_or("?".into()),
+                        text
+                    ))
+                }
+                .await;
+                let _ = tx.send(UiMsg::ScheduleDone(
+                    s.id,
+                    now(),
+                    res.unwrap_or_else(|e| format!("failed: {e}")),
+                ));
+                ctx.request_repaint();
+            });
+        }
+        self.ctx.request_repaint_after(Duration::from_secs(15));
+    }
+
+    fn schedules_window(&mut self, ctx: &egui::Context) {
+        if !self.show_schedules {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Schedules").open(&mut open).default_width(560.0).show(ctx, |ui| {
+            ui.small("Runs a command on a host at a set time. sshield must be open and unlocked; hosts that ask for a password each time will prompt.");
+            let mut remove: Option<usize> = None;
+            let mut toggle: Option<usize> = None;
+            let t = now();
+            for (i, s) in self.lib.schedules.iter().enumerate() {
+                let host = self.lib.hosts.iter().find(|h| h.id == s.host_id).map(|h| h.label.clone()).unwrap_or("(deleted host)".into());
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(&s.name);
+                        ui.label(format!("on {host}"));
+                        let when = if !s.enabled { "finished/paused".to_string() } else if s.run_at <= t { "due now".to_string() } else { format!("in {}", fmt_dur(Duration::from_secs(s.run_at - t))) };
+                        ui.label(when);
+                        if s.repeat_secs > 0 {
+                            ui.label(format!("every {}", fmt_dur(Duration::from_secs(s.repeat_secs))));
+                        }
+                        if ui.small_button(if s.enabled { "Pause" } else { "Enable" }).clicked() {
+                            toggle = Some(i);
+                        }
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                    ui.monospace(&s.command);
+                    if !s.last_result.is_empty() {
+                        ui.collapsing("Last result", |ui| ui.monospace(&s.last_result));
+                    }
+                });
+            }
+            if let Some(i) = toggle {
+                self.mutate(|l| {
+                    let s = &mut l.schedules[i];
+                    s.enabled = !s.enabled;
+                    if s.enabled && s.run_at <= t {
+                        s.run_at = t + 5;
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                self.mutate(|l| {
+                    l.schedules.remove(i);
+                });
+            }
+            ui.separator();
+            ui.strong("New schedule");
+            ui.add(egui::TextEdit::singleline(&mut self.sched_name).hint_text("Name, e.g. nightly backup").desired_width(f32::INFINITY));
+            let labels: Vec<String> = self.lib.hosts.iter().map(|h| h.label.clone()).collect();
+            if self.sched_host >= labels.len() {
+                self.sched_host = 0;
+            }
+            egui::ComboBox::from_label("Host").selected_text(labels.get(self.sched_host).cloned().unwrap_or_default()).show_ui(ui, |ui| {
+                for (i, l) in labels.iter().enumerate() {
+                    ui.selectable_value(&mut self.sched_host, i, l);
+                }
+            });
+            ui.add(egui::TextEdit::singleline(&mut self.sched_cmd).hint_text("Command, e.g. sudo apt-get update").desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
+            ui.horizontal(|ui| {
+                ui.label("Run in");
+                ui.add(egui::DragValue::new(&mut self.sched_delay).range(1..=999));
+                egui::ComboBox::from_id_salt("sched_unit").selected_text(["minutes", "hours", "days"][self.sched_unit as usize]).show_ui(ui, |ui| {
+                    for (i, n) in ["minutes", "hours", "days"].iter().enumerate() {
+                        ui.selectable_value(&mut self.sched_unit, i as u8, *n);
+                    }
+                });
+                ui.checkbox(&mut self.sched_repeat, "repeat at that interval");
+            });
+            let ok = !self.sched_cmd.trim().is_empty() && !labels.is_empty();
+            if ui.add_enabled(ok, egui::Button::new("Add schedule")).clicked() {
+                let secs = self.sched_delay as u64 * [60u64, 3600, 86400][self.sched_unit as usize];
+                let host_id = self.lib.hosts[self.sched_host].id.clone();
+                let sc = Schedule {
+                    id: new_id(),
+                    name: if self.sched_name.trim().is_empty() { self.sched_cmd.chars().take(24).collect() } else { self.sched_name.trim().to_string() },
+                    host_id,
+                    command: self.sched_cmd.trim().to_string(),
+                    run_at: t + secs,
+                    repeat_secs: if self.sched_repeat { secs } else { 0 },
+                    enabled: true,
+                    last_run: None,
+                    last_result: String::new(),
+                };
+                self.mutate(|l| l.schedules.push(sc));
+                self.sched_cmd.clear();
+                self.sched_name.clear();
+            }
+        });
+        if !open {
+            self.show_schedules = false;
+        }
+    }
+
     fn export_hosts(&mut self, kind: &str, text: String) {
-        let dir = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| self.data_dir.clone());
-        let name = if kind == "json" { "sshield-hosts.json" } else { "sshield-ssh_config" };
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| self.data_dir.clone());
+        let name = if kind == "json" {
+            "sshield-hosts.json"
+        } else {
+            "sshield-ssh_config"
+        };
         let path = dir.join(name);
         match std::fs::write(&path, text) {
-            Ok(_) => self.toast(format!("Exported {} hosts to {}", self.lib.hosts.len(), path.display())),
+            Ok(_) => self.toast(format!(
+                "Exported {} hosts to {}",
+                self.lib.hosts.len(),
+                path.display()
+            )),
             Err(e) => self.toast(format!("Export failed: {e}")),
         }
     }
@@ -1883,6 +2100,7 @@ impl App {
         self.host_editor_window(ctx);
         self.snippets_window(ctx);
         self.palette_window(ctx);
+        self.schedules_window(ctx);
         self.settings_window(ctx);
         if let Some(id) = self.confirm_delete.clone() {
             let name = self
