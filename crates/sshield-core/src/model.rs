@@ -175,6 +175,8 @@ pub struct Settings {
     pub copy_on_select: bool,
     /// In full-screen apps (tmux, less, vim) the wheel sends arrow keys. Off by default.
     pub wheel_sends_arrows: bool,
+    /// Check GitHub Releases for a newer version at startup.
+    pub check_updates: bool,
     pub cursor_blink: bool,
     pub log_sessions: bool,
     pub log_dir: String,
@@ -199,6 +201,7 @@ impl Default for Settings {
             scrollback: 10_000,
             copy_on_select: true,
             wheel_sends_arrows: false,
+            check_updates: true,
                     cursor_blink: true,
             log_sessions: false,
             log_dir: String::new(),

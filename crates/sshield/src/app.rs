@@ -40,6 +40,10 @@ enum UiMsg {
     },
     Unlocked(Result<(Vault, Library), String>),
     Toast(String),
+    /// Result of an update check; `manual` checks report "up to date".
+    Update(Result<Option<crate::update::Release>, String>, bool),
+    /// Installer launched (Ok) or failed.
+    InstallStarted(Result<(), String>),
 }
 
 struct UiInteractor {
@@ -284,6 +288,8 @@ pub struct App {
     next_id: u64,
     pending: VecDeque<Pending>,
     toasts: Vec<(String, Instant)>,
+    update: Option<crate::update::Release>,
+    installing: bool,
     search: String,
     quick: String,
     editor: Option<HostEditor>,
@@ -346,6 +352,8 @@ impl App {
             next_id: 1,
             pending: VecDeque::new(),
             toasts: vec![],
+            update: None,
+            installing: false,
             search: String::new(),
             quick: String::new(),
             editor: None,
@@ -463,6 +471,29 @@ impl App {
     }
 
     // ------------------------------------------------------------ vault
+
+    fn check_update(&self, manual: bool) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.rt.spawn_blocking(move || {
+            let _ = tx.send(UiMsg::Update(crate::update::check(), manual));
+            ctx.request_repaint();
+        });
+    }
+
+    fn install_update(&mut self) {
+        let Some(rel) = self.update.clone() else { return };
+        match rel.installer_url {
+            Some(url) if cfg!(windows) => {
+                self.installing = true;
+                let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+                self.rt.spawn_blocking(move || {
+                    let _ = tx.send(UiMsg::InstallStarted(crate::update::download_and_run(&url)));
+                    ctx.request_repaint();
+                });
+            }
+            _ => self.ctx.open_url(egui::OpenUrl::new_tab(crate::update::RELEASES_PAGE)),
+        }
+    }
 
     fn do_unlock(&mut self, create: bool) {
         let (path, pw, tx, ctx) = (
@@ -676,12 +707,29 @@ impl App {
                     reply: Some(reply),
                 }),
                 UiMsg::Toast(s) => self.toast(s),
+                UiMsg::Update(r, manual) => match r {
+                    Ok(Some(rel)) => self.update = Some(rel),
+                    Ok(None) if manual => self.toast("sshield is up to date"),
+                    Err(e) if manual => self.toast(format!("Update check failed: {e}")),
+                    _ => {}
+                },
+                UiMsg::InstallStarted(r) => match r {
+                    // the installer replaces our exe, so quit and let it relaunch us
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        self.installing = false;
+                        self.toast(format!("Update failed: {e}"));
+                    }
+                },
                 UiMsg::Unlocked(r) => {
                     self.unlocking = false;
                     match r {
                         Ok((v, lib)) => {
                             self.vault = Some(v);
                             self.lib = lib;
+                            if self.lib.settings.check_updates {
+                                self.check_update(false);
+                            }
                             self.pw.clear();
                             self.pw2.clear();
                             self.applied_font = "\u{0}".into();
@@ -1168,6 +1216,18 @@ impl App {
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.small("vault encrypted · XChaCha20-Poly1305 + Argon2id");
+                        if let Some(rel) = self.update.clone() {
+                            let label = if self.installing {
+                                "Updating…".to_string()
+                            } else if cfg!(windows) && rel.installer_url.is_some() {
+                                format!("⬆ Update to v{} — install & restart", rel.version)
+                            } else {
+                                format!("⬆ v{} available — open download", rel.version)
+                            };
+                            if ui.add_enabled(!self.installing, egui::Button::small(egui::Button::new(label))).clicked() {
+                                self.install_update();
+                            }
+                        }
                     });
                 });
             });
@@ -2090,8 +2150,13 @@ impl App {
                 SettingsTab::About => {
                     ui.heading("sshield");
                     ui.label(format!("version {}", env!("CARGO_PKG_VERSION")));
-                    ui.label("Free and open source (Apache-2.0). No accounts, no telemetry, no paywalls.");
+                    ui.label("Free and open source (Apache-2.0). No accounts, no telemetry (the optional update check only contacts GitHub), no paywalls.");
                     ui.label(format!("Data directory: {}", self.data_dir.display()));
+                    ui.separator();
+                    ui.checkbox(&mut self.lib.settings.check_updates, "Check for updates at startup (contacts api.github.com only)");
+                    if ui.button("Check for updates now").clicked() {
+                        self.check_update(true);
+                    }
                 }
             });
         });

@@ -5,6 +5,7 @@ mod app;
 mod sftp_view;
 mod term;
 mod theme;
+mod update;
 
 fn main() -> eframe::Result {
     let rt = tokio::runtime::Builder::new_multi_thread()
