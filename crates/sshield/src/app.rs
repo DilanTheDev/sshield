@@ -261,6 +261,8 @@ impl App {
         let lib = Library::default();
         let theme = theme::find(&lib.settings.theme);
         theme::apply_visuals(&cc.egui_ctx, &theme, lib.settings.accent, 1.0);
+        // Ctrl +/-/scroll zoom the terminal font, not the whole UI.
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         App {
             rt,
             ctx: cc.egui_ctx.clone(),
@@ -761,9 +763,32 @@ impl App {
         });
     }
 
+    fn zoom_font(&mut self, factor: f32) {
+        let cur = self.lib.settings.font_size;
+        let new = (cur * factor).clamp(8.0, 40.0);
+        // round to half points so repeated wheel ticks feel like discrete steps
+        let new = if (factor - 1.0).abs() < 0.2 && (new - cur).abs() < 0.5 { cur + (factor - 1.0).signum() * 0.5 } else { new };
+        let new = ((new * 2.0).round() / 2.0).clamp(8.0, 40.0);
+        if new != cur {
+            self.mutate(|l| l.settings.font_size = new);
+        }
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
         let k = |m: Modifiers, key: Key| KeyboardShortcut::new(m, key);
+        // Font zoom: Ctrl + / Ctrl - / Ctrl 0 (like Termius)
+        for m in [Modifiers::COMMAND, Modifiers::COMMAND | Modifiers::SHIFT] {
+            if ctx.input_mut(|i| i.consume_shortcut(&k(m, Key::Equals)) | i.consume_shortcut(&k(m, Key::Plus))) {
+                self.zoom_font(1.1);
+            }
+            if ctx.input_mut(|i| i.consume_shortcut(&k(m, Key::Minus))) {
+                self.zoom_font(1.0 / 1.1);
+            }
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&k(Modifiers::COMMAND, Key::Num0))) {
+            self.mutate(|l| l.settings.font_size = 14.0);
+        }
         if ctx.input_mut(|i| i.consume_shortcut(&k(Modifiers::COMMAND, Key::K))) {
             self.palette = Some(String::new());
         }
@@ -816,7 +841,13 @@ impl App {
                         TabKind::Home => "⌂ ",
                         _ => "",
                     };
-                    let r = ui.selectable_label(sel, format!("{dot}{}", t.title));
+                    let accent = c(self.lib.settings.accent);
+                    let txt = RichText::new(format!("{dot}{}", t.title)).color(if sel { c(self.theme.fg) } else { c(self.theme.fg).gamma_multiply(0.6) });
+                    let r = ui.add(egui::Button::new(txt).selected(sel).min_size(egui::vec2(0.0, 26.0)).corner_radius(egui::CornerRadius::same(8)).fill(if sel { c(self.theme.selection).gamma_multiply(0.7) } else { egui::Color32::TRANSPARENT }));
+                    if sel {
+                        let y = r.rect.bottom() + 2.0;
+                        ui.painter().line_segment([egui::pos2(r.rect.left() + 6.0, y), egui::pos2(r.rect.right() - 6.0, y)], egui::Stroke::new(2.0, accent));
+                    }
                     if r.clicked() {
                         activate = Some(i);
                     }
@@ -940,6 +971,7 @@ impl App {
         let mut input_out: Vec<u8> = vec![];
         let mut sftp_host: Option<Host> = None;
         let mut stop_fwd: Option<usize> = None;
+        let mut zoom = 1.0f32;
         {
             let TabKind::Term(tt) = &mut self.tabs[idx].kind else { return };
             match &tt.state {
@@ -990,6 +1022,7 @@ impl App {
                         });
                     });
                     let out = tt.term.show(ui, &theme, &settings, true);
+                    zoom = out.zoom;
                     if let Some(l) = out.submitted {
                         submitted = Some(l);
                     }
@@ -1015,6 +1048,9 @@ impl App {
         }
         if broadcast && !input_out.is_empty() {
             self.send_to_all(&input_out);
+        }
+        if (zoom - 1.0).abs() > f32::EPSILON {
+            self.zoom_font(zoom);
         }
         if let Some(l) = submitted {
             self.mutate(|lib| lib.push_history(&l));

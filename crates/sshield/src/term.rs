@@ -9,7 +9,12 @@ fn nz(v: u16) -> NonZeroU16 {
     NonZeroU16::new(v.max(1)).unwrap()
 }
 
-#[derive(Default)]
+impl Default for TermOutput {
+    fn default() -> Self {
+        TermOutput { input: vec![], resize: None, submitted: None, clicked: false, zoom: 1.0 }
+    }
+}
+
 pub struct TermOutput {
     /// Bytes to send to the remote (already encoded).
     pub input: Vec<u8>,
@@ -18,6 +23,8 @@ pub struct TermOutput {
     /// A full command line the user just submitted (for history).
     pub submitted: Option<String>,
     pub clicked: bool,
+    /// Multiplicative font zoom requested via Ctrl+scroll (1.0 = none).
+    pub zoom: f32,
 }
 
 pub struct TermView {
@@ -145,8 +152,32 @@ impl TermView {
             }
         });
 
-        // ---- wheel
+        // ---- Ctrl+scroll => zoom font; Ctrl+click => open link
+        let mut link: Option<(u16, u16, u16, String)> = None;
         if resp.hovered() {
+            let (zd, ctrl, hover) = ui.input(|i| (i.zoom_delta(), i.modifiers.ctrl, i.pointer.hover_pos()));
+            if (zd - 1.0).abs() > f32::EPSILON {
+                out.zoom = zd;
+            }
+            if ctrl {
+                if let Some(p) = hover.filter(|p| inner.contains(*p)) {
+                    let (r, col) = cell_at(p);
+                    link = self.url_at(r, col);
+                    if link.is_some() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+            }
+        }
+        if resp.clicked() {
+            if let (Some((_, _, _, url)), true) = (&link, ui.input(|i| i.modifiers.ctrl)) {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(url.clone()));
+                self.sel = None;
+            }
+        }
+
+        // ---- wheel
+        if resp.hovered() && out.zoom == 1.0 {
             let dy = ui.input(|i| i.smooth_scroll_delta.y);
             self.scroll_accum += dy / ch;
             let lines = self.scroll_accum.trunc() as i32;
@@ -292,6 +323,13 @@ impl TermView {
             flush(&mut run, run_start, run_fg, run_ul);
         }
 
+        if let Some((r, a, b, _)) = &link {
+            let y = inner.top() + (*r as f32 + 1.0) * ch - 1.0;
+            let x0 = inner.left() + *a as f32 * cw;
+            let x1 = inner.left() + (*b as f32 + 1.0) * cw;
+            painter.line_segment([Pos2::new(x0, y), Pos2::new(x1, y)], Stroke::new(1.5, c(theme.ansi[4])));
+        }
+
         // cursor
         if screen.scrollback() == 0 && !screen.hide_cursor() {
             let (cr, cc) = screen.cursor_position();
@@ -327,6 +365,37 @@ impl TermView {
             painter.galley(r.min, g, c(theme.bg));
         }
         out
+    }
+
+    /// URL under the given cell, as (row, start col, end col, url).
+    fn url_at(&self, row: u16, col: u16) -> Option<(u16, u16, u16, String)> {
+        let scr = self.parser.screen();
+        let chars: Vec<char> = (0..self.cols)
+            .map(|cc| scr.cell(row, cc).and_then(|x| x.contents().chars().next()).unwrap_or(' '))
+            .collect();
+        let ws = |i: usize| chars[i].is_whitespace();
+        let col = col as usize;
+        if col >= chars.len() || ws(col) {
+            return None;
+        }
+        let (mut a, mut b) = (col, col);
+        while a > 0 && !ws(a - 1) {
+            a -= 1;
+        }
+        while b + 1 < chars.len() && !ws(b + 1) {
+            b += 1;
+        }
+        let tok: String = chars[a..=b].iter().collect();
+        let p = ["https://", "http://", "ftp://"].iter().filter_map(|pre| tok.find(pre)).min()?;
+        let start = a + tok[..p].chars().count();
+        let mut end = b;
+        while end > start && matches!(chars[end], '.' | ',' | ';' | ':' | ')' | ']' | '}' | '>' | '\'' | '"' | '!' | '?') {
+            end -= 1;
+        }
+        if col < start || col > end {
+            return None;
+        }
+        Some((row, start as u16, end as u16, chars[start..=end].iter().collect()))
     }
 
     fn word_at(&self, row: u16, col: u16) -> ((u16, u16), (u16, u16)) {
@@ -387,6 +456,19 @@ impl TermView {
                 }
             }
             Event::Cut => out.input.push(0x18),
+            // Termius-style terminal shortcuts: Ctrl+Shift+C / Ctrl+Shift+V / Shift+Insert.
+            Event::Key { key: Key::C, pressed: true, modifiers, .. } if modifiers.ctrl && modifiers.shift => {
+                if let Some(t) = self.selection_text() {
+                    ctx.copy_text(t);
+                }
+            }
+            Event::Key { key, pressed: true, modifiers, .. }
+                if (key == Key::V && modifiers.ctrl && modifiers.shift) || (key == Key::Insert && modifiers.shift && !modifiers.ctrl) =>
+            {
+                if let Some(t) = arboard::Clipboard::new().and_then(|mut cb| cb.get_text()).ok().filter(|t| !t.is_empty()) {
+                    self.handle_event(Event::Paste(t), out, ctx);
+                }
+            }
             Event::Key { key, pressed: true, modifiers, .. } => self.handle_key(key, modifiers, out),
             _ => {}
         }
@@ -563,6 +645,16 @@ mod tests {
         t.sel = Some(((0, 0), (0, 4)));
         assert_eq!(t.selection_text().as_deref(), Some("hello"));
         assert_eq!(t.word_at(0, 8), ((0, 6), (0, 10)));
+    }
+
+    #[test]
+    fn finds_urls() {
+        let mut t = TermView::new(10);
+        t.feed(b"see (https://example.com/a?b=1). ok");
+        let (r, a, b, u) = t.url_at(0, 12).unwrap();
+        assert_eq!((r, a, u.as_str()), (0, 5, "https://example.com/a?b=1"));
+        assert_eq!(b, 29);
+        assert!(t.url_at(0, 1).is_none());
     }
 
     #[test]

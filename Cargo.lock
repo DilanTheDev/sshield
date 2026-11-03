@@ -3747,6 +3747,7 @@ dependencies = [
 name = "sshield"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "eframe",
  "egui",
  "futures",
