@@ -1,6 +1,6 @@
 # sshield
 
-A fast, native, **completely free** SSH client for Windows (first-class), Linux and macOS —
+A fast, native, **completely free** SSH client for Windows (first-class) and Linux —
 built in Rust, one ~15 MB executable, no Electron, no account, no telemetry, no paywall.
 
 It aims at everything Termius locks behind a subscription (SFTP, snippets, jump hosts,
@@ -34,15 +34,15 @@ and adds one thing it doesn't have: **force all SSH traffic through WireGuard or
 
 *Settings → VPN* (global) and *Host → VPN* (per-host: follow global / always / never).
 
-1. **Tunnel lifecycle** – choose *WireGuard* (`wg-quick up` on Linux/macOS, `wireguard.exe /installtunnelservice` on Windows),
+1. **Tunnel lifecycle** – choose *WireGuard* (`wg-quick up` on Linux, `wireguard.exe /installtunnelservice` on Windows),
    *OpenVPN* (`openvpn --config …`, supervised child process) or *Already running* (you manage the VPN; sshield only enforces).
    With "start automatically", sshield brings the tunnel up on demand and waits for the interface.
 2. **Route verification** – before connecting, the OS is asked which interface would carry traffic to the destination
-   (`ip route get` / `/proc/net/route` on Linux, `route -n get` on macOS, `Find-NetRoute` on Windows).
+   (`ip route get` / `/proc/net/route` on Linux, `Find-NetRoute` on Windows).
    If it isn't the tunnel interface (e.g. split-tunnel that doesn't cover the host) the connection is **refused**
    with an explanation — never leaked.
 3. **Socket pinning** – the TCP socket is bound to the tunnel interface and its address
-   (`SO_BINDTODEVICE` on Linux, `IP_UNICAST_IF`/`IPV6_UNICAST_IF` on Windows, `IP_BOUND_IF` on macOS).
+   (`SO_BINDTODEVICE` on Linux, `IP_UNICAST_IF`/`IPV6_UNICAST_IF` on Windows).
 
 If anything can't be verified, the connection fails (configurable "fail closed" is on by default).
 Jump-host chains are covered: only the first TCP hop touches the network and it is pinned; later hops ride inside it.
@@ -87,7 +87,7 @@ Tested: vault crypto, host-key TOFU (new/changed/rejected), password / prompt au
 jump chain, SFTP round trip (300 KB, byte-identical), VPN fail-closed + pinned socket (using the loopback interface
 as the "tunnel"), terminal emulation + input encoding, and the GUI end-to-end under Xvfb against a real `bash`.
 
-Cross-checked for Windows with `cargo check --target x86_64-pc-windows-gnu` (a CI workflow for Windows/Linux/macOS is included but has not run yet), but the Windows-specific paths
+Cross-checked for Windows with `cargo check --target x86_64-pc-windows-gnu` (CI runs on Windows and Linux), but the Windows-specific paths
 (`IP_UNICAST_IF`, PowerShell route lookup, `wireguard.exe` service install) have **not been run against a real
 Windows VPN yet** — please try them and report. Likewise real WireGuard/OpenVPN tunnels were not available in the
 development sandbox; the lifecycle code paths are unit-tested for command construction, not executed.
