@@ -44,6 +44,8 @@ pub struct TermView {
     line_valid: bool,
     scroll_accum: f32,
     pub suggestion: Option<String>,
+    /// Fixed grid (guest view of a shared session): follows the host, never resizes itself.
+    pub fixed: Option<(u16, u16)>,
 }
 
 impl TermView {
@@ -58,6 +60,7 @@ impl TermView {
             line_valid: true,
             scroll_accum: 0.0,
             suggestion: None,
+            fixed: None,
         }
     }
 
@@ -95,13 +98,17 @@ impl TermView {
         let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
         let pad = 6.0;
         let inner = rect.shrink(pad);
-        let cols = ((inner.width() / cw).floor() as u16).max(2);
-        let rows = ((inner.height() / ch).floor() as u16).max(2);
+        let (cols, rows) = self.fixed.unwrap_or((
+            ((inner.width() / cw).floor() as u16).max(2),
+            ((inner.height() / ch).floor() as u16).max(2),
+        ));
         if (cols, rows) != (self.cols, self.rows) {
             self.cols = cols;
             self.rows = rows;
             self.parser.set_size(nz(rows), nz(cols));
-            out.resize = Some((cols, rows));
+            if self.fixed.is_none() {
+                out.resize = Some((cols, rows));
+            }
         }
 
         if focused_tab && !resp.has_focus() && !ui.memory(|m| m.focused().is_some()) {
@@ -794,6 +801,20 @@ mod tests {
         t.sel = Some(((0, 0), (0, 4)));
         assert_eq!(t.selection_text().as_deref(), Some("hello"));
         assert_eq!(t.word_at(0, 8), ((0, 6), (0, 10)));
+    }
+
+    #[test]
+    fn snapshot_rebuilds_screen_for_guest() {
+        let mut host = TermView::new(10);
+        host.feed(b"\x1b[31mred\x1b[0m line\r\nsecond");
+        let snap = host.parser.screen().state_formatted();
+        let mut guest = TermView::new(10);
+        guest.fixed = Some(host.size());
+        guest.feed(snap.as_bytes());
+        assert_eq!(
+            guest.parser.screen().contents(),
+            host.parser.screen().contents()
+        );
     }
 
     #[test]

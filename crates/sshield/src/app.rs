@@ -4,6 +4,7 @@ use crate::theme::{self, c, Theme};
 use eframe::egui::{self, Align, Layout, RichText};
 use futures::future::BoxFuture;
 use sshield_core::forward::{self, ForwardHandle};
+use sshield_core::share::{self, Frame as ShareFrame, Role as ShareRole, ShareLink};
 use sshield_core::ssh::{
     self, Connection, Connector, HostKeyQuery, Interactor, ShellCmd, ShellEvent,
 };
@@ -65,6 +66,8 @@ enum UiMsg {
     Sync(SyncMsg),
     ScheduleDone(Id, u64, String),
     AgentDone(Result<String, String>),
+    ShareStarted(u64, ShareLink, Result<share::Connection, String>),
+    ShareJoined(Result<share::Connection, String>),
     /// Installer launched (Ok) or failed.
     InstallStarted(Result<(), String>),
 }
@@ -111,7 +114,32 @@ enum TermState {
     Closed(String),
 }
 
+/// A terminal we are broadcasting to other sshield users (end-to-end encrypted via the relay).
+struct ShareHost {
+    link: ShareLink,
+    conn: share::Connection,
+    allow_input: bool,
+    guests: usize,
+    last_size: (u16, u16),
+    /// Random per sharing session; guests must echo it in `Input`, so frames captured from any
+    /// other session (or replayed by the relay) are ignored.
+    epoch: u64,
+    /// Stale/replayed frames discarded by the relay-facing decryptor.
+    rejected: u64,
+}
+
+/// A shared terminal we joined as a guest.
+struct SharedTab {
+    term: TermView,
+    conn: share::Connection,
+    allow_input: bool,
+    closed: Option<String>,
+    got_snapshot: bool,
+    epoch: Option<u64>,
+}
+
 struct TermTab {
+    share: Option<ShareHost>,
     host: Host,
     state: TermState,
     term: TermView,
@@ -141,6 +169,7 @@ enum TabKind {
     Home,
     Term(Box<TermTab>),
     Sftp(Box<SftpEntry>),
+    Shared(Box<SharedTab>),
 }
 
 struct Tab {
@@ -329,6 +358,11 @@ pub struct App {
     show_snippets: bool,
     show_schedules: bool,
     show_agent: bool,
+    show_join: bool,
+    share_dialog: Option<u64>,
+    share_server_in: String,
+    join_link_in: String,
+    share_status: String,
     agent_kind: u8,
     agent_prompt: String,
     agent_ctx: bool,
@@ -415,6 +449,11 @@ impl App {
             show_snippets: false,
             show_schedules: false,
             show_agent: false,
+            show_join: false,
+            share_dialog: None,
+            share_server_in: String::new(),
+            join_link_in: String::new(),
+            share_status: String::new(),
             agent_kind: 0,
             agent_prompt: String::new(),
             agent_ctx: true,
@@ -829,6 +868,7 @@ impl App {
             host: host.clone(),
             state: TermState::Connecting,
             term: TermView::new(scrollback),
+            share: None,
             conn: None,
             tx: None,
             ev_rx: None,
@@ -1024,6 +1064,48 @@ impl App {
                 }
                 UiMsg::Session { tab, res } => self.on_session(tab, res),
                 UiMsg::Sync(m) => self.on_sync(m),
+                UiMsg::ShareStarted(tab, link, res) => match res {
+                    Ok(conn) => {
+                        if let Some(TabKind::Term(tt)) = self
+                            .tabs
+                            .iter_mut()
+                            .find(|t| t.id == tab)
+                            .map(|t| &mut t.kind)
+                        {
+                            tt.share = Some(ShareHost {
+                                link,
+                                conn,
+                                allow_input: false,
+                                guests: 0,
+                                last_size: (0, 0),
+                                epoch: share::random_u64(),
+                                rejected: 0,
+                            });
+                        }
+                        self.share_status.clear();
+                    }
+                    Err(e) => self.share_status = format!("Could not start sharing: {e}"),
+                },
+                UiMsg::ShareJoined(res) => match res {
+                    Ok(conn) => {
+                        let mut term = TermView::new(2000);
+                        term.fixed = Some((80, 24));
+                        self.new_tab(
+                            "Shared".into(),
+                            TabKind::Shared(Box::new(SharedTab {
+                                term,
+                                conn,
+                                allow_input: false,
+                                closed: None,
+                                got_snapshot: false,
+                                epoch: None,
+                            })),
+                        );
+                        self.share_status.clear();
+                        self.show_join = false;
+                    }
+                    Err(e) => self.share_status = format!("Could not join: {e}"),
+                },
                 UiMsg::AgentDone(r) => {
                     self.agent_busy = false;
                     self.agent_out = r.unwrap_or_else(|e| format!("⚠ {e}"));
@@ -1091,6 +1173,46 @@ impl App {
 
     fn pump_terminals(&mut self) {
         for t in &mut self.tabs {
+            if let TabKind::Shared(st) = &mut t.kind {
+                while let Ok(ev) = st.conn.rx.try_recv() {
+                    match ev {
+                        share::Event::Frame(ShareFrame::Snapshot { cols, rows, data }, _) => {
+                            st.term.fixed = Some((cols, rows));
+                            st.term.feed(b"\x1bc");
+                            st.term.parser.set_size(
+                                std::num::NonZeroU16::new(rows.max(1)).unwrap(),
+                                std::num::NonZeroU16::new(cols.max(1)).unwrap(),
+                            );
+                            st.term.feed(&data);
+                            st.got_snapshot = true;
+                        }
+                        // Output is only applied when it directly follows the previous host frame.
+                        // A gap (dropped/reordered by the relay) discards the view and asks for a
+                        // fresh snapshot instead of silently showing a wrong screen.
+                        share::Event::Frame(ShareFrame::Output(d), meta) => {
+                            if st.got_snapshot && meta.in_order {
+                                st.term.feed(&d);
+                            } else {
+                                st.got_snapshot = false;
+                            }
+                        }
+                        share::Event::Frame(ShareFrame::Allow { allowed, epoch }, _) => {
+                            st.allow_input = allowed;
+                            st.epoch = Some(epoch);
+                        }
+                        share::Event::Frame(ShareFrame::End, _) => {
+                            st.closed = Some("The host ended the session.".into())
+                        }
+                        share::Event::Closed(r) => {
+                            if st.closed.is_none() {
+                                st.closed = Some(r);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
             if let TabKind::Term(tt) = &mut t.kind {
                 let mut closed: Option<String> = None;
                 if let Some(rx) = &tt.ev_rx {
@@ -1100,6 +1222,9 @@ impl App {
                             Ok(ShellEvent::Output(b)) => {
                                 budget = budget.saturating_sub(b.len());
                                 tt.term.feed(&b);
+                                if let Some(sh) = &tt.share {
+                                    let _ = sh.conn.tx.send(ShareFrame::Output(b.clone()));
+                                }
                                 if let Some(f) = &mut tt.log {
                                     let _ = f.write_all(&b);
                                 }
@@ -1118,7 +1243,55 @@ impl App {
                         self.ctx.request_repaint();
                     }
                 }
+                // sharing: answer guests, apply allowed input, track viewers
+                let mut share_ended: Option<String> = None;
+                if let Some(sh) = &mut tt.share {
+                    let size = tt.term.size();
+                    let snap = |sh: &ShareHost, term: &TermView| {
+                        let (cols, rows) = term.size();
+                        let _ = sh.conn.tx.send(ShareFrame::Snapshot {
+                            cols,
+                            rows,
+                            data: term.parser.screen().state_formatted().into(),
+                        });
+                        let _ = sh.conn.tx.send(ShareFrame::Allow {
+                            allowed: sh.allow_input,
+                            epoch: sh.epoch,
+                        });
+                    };
+                    if size != sh.last_size {
+                        sh.last_size = size;
+                        snap(sh, &tt.term);
+                    }
+                    while let Ok(ev) = sh.conn.rx.try_recv() {
+                        match ev {
+                            share::Event::Frame(ShareFrame::Hello, _) => snap(sh, &tt.term),
+                            // Keystrokes are only accepted when input is on, they belong to this
+                            // session (epoch) and nothing before them was dropped, replayed or
+                            // reordered (in_order). Anything else is ignored.
+                            share::Event::Frame(ShareFrame::Input { epoch, data }, meta)
+                                if sh.allow_input && epoch == sh.epoch && meta.in_order =>
+                            {
+                                if let Some(tx) = &tt.tx {
+                                    let _ = tx.send(ShellCmd::Input(data));
+                                }
+                            }
+                            share::Event::Rejected(n) => sh.rejected = n,
+                            share::Event::Guests(n) => sh.guests = n,
+                            share::Event::Closed(r) => share_ended = Some(r),
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some(r) = share_ended {
+                    tt.share = None;
+                    self.toasts
+                        .push((format!("Sharing stopped: {r}"), Instant::now()));
+                }
                 if let Some(msg) = closed {
+                    if let Some(sh) = tt.share.take() {
+                        let _ = sh.conn.tx.send(ShareFrame::End);
+                    }
                     tt.state = TermState::Closed(msg);
                     tt.tx = None;
                     tt.ev_rx = None;
@@ -1134,6 +1307,9 @@ impl App {
         }
         let t = self.tabs.remove(idx);
         if let TabKind::Term(tt) = t.kind {
+            if let Some(sh) = &tt.share {
+                let _ = sh.conn.tx.send(ShareFrame::End);
+            }
             if let Some(tx) = &tt.tx {
                 let _ = tx.send(ShellCmd::Close);
             }
@@ -1574,6 +1750,7 @@ impl App {
             TabKind::Home => 0,
             TabKind::Term(_) => 1,
             TabKind::Sftp(_) => 2,
+            TabKind::Shared(_) => 3,
         };
         match kind_tag {
             0 => {
@@ -1583,6 +1760,7 @@ impl App {
                     .inner
             }
             1 => self.terminal_body(ui, active),
+            3 => self.shared_body(ui, active),
             _ => {
                 let theme = self.theme.clone();
                 let mut reopen: Option<Host> = None;
@@ -1630,6 +1808,7 @@ impl App {
         let mut input_out: Vec<u8> = vec![];
         let mut sftp_host: Option<Host> = None;
         let mut stop_fwd: Option<usize> = None;
+        let mut share_dialog = false;
         let mut zoom = 1.0f32;
         {
             let TabKind::Term(tt) = &mut self.tabs[idx].kind else {
@@ -1673,7 +1852,13 @@ impl App {
                                     open_sftp = tt.conn.clone();
                                     sftp_host = Some(tt.host.clone());
                                 }
-                                if ui.small_button("⌫ Clear").clicked() {
+                                if let Some(sh) = &tt.share {
+                                ui.colored_label(c(theme.ansi[1]), format!("● SHARING · {} viewer(s){}{}", sh.guests, if sh.allow_input { " · input ON" } else { "" }, if sh.rejected > 0 { format!(" · ⚠ {} replayed frame(s) blocked", sh.rejected) } else { String::new() }));
+                            }
+                            if ui.small_button(if tt.share.is_some() { "🔗 Sharing…" } else { "🔗 Share" }).on_hover_text("Let another sshield user watch (and, if you allow, type in) this terminal").clicked() {
+                                share_dialog = true;
+                            }
+                            if ui.small_button("⌫ Clear").clicked() {
                                     tt.term.feed(b"\x1b[2J\x1b[3J\x1b[H");
                                 }
                                 for (i, f) in tt.forwards.iter().enumerate() {
@@ -1733,6 +1918,12 @@ impl App {
         }
         if broadcast && !input_out.is_empty() {
             self.send_to_all(&input_out);
+        }
+        if share_dialog {
+            self.share_dialog = Some(self.tabs[idx].id);
+            if self.share_server_in.is_empty() {
+                self.share_server_in = self.sync.url.clone();
+            }
         }
         if (zoom - 1.0).abs() > f32::EPSILON {
             self.zoom_font(zoom);
@@ -1908,6 +2099,189 @@ impl App {
         });
         if !open {
             self.show_agent = false;
+        }
+    }
+
+    fn shared_body(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let theme = self.theme.clone();
+        let settings = self.lib.settings.clone();
+        let TabKind::Shared(st) = &mut self.tabs[idx].kind else {
+            return;
+        };
+        egui::Panel::top("shared_bar")
+            .frame(
+                egui::Frame::NONE
+                    .fill(c(theme.bg))
+                    .inner_margin(egui::Margin::symmetric(8, 2)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| match &st.closed {
+                    Some(msg) => {
+                        ui.colored_label(c(theme.ansi[3]), msg);
+                    }
+                    None => {
+                        ui.colored_label(c(theme.ansi[2]), "● Live shared session");
+                        ui.label(if st.allow_input {
+                            "You can type (host allowed input)"
+                        } else {
+                            "View only - the host has not allowed input"
+                        });
+                    }
+                });
+            });
+        let out = st.term.show(ui, &theme, &settings, true);
+        if let (true, None, Some(epoch), false) =
+            (st.allow_input, &st.closed, st.epoch, out.input.is_empty())
+        {
+            let _ = st.conn.tx.send(ShareFrame::Input {
+                epoch,
+                data: out.input,
+            });
+        }
+        if !st.got_snapshot && st.closed.is_none() {
+            // ask the host for the screen until it arrives (cheap; throttled by repaint)
+            if (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0 {
+                let _ = st.conn.tx.send(ShareFrame::Hello);
+            }
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    fn share_windows(&mut self, ctx: &egui::Context) {
+        // ---- host: start / manage sharing
+        if let Some(tab_id) = self.share_dialog {
+            let mut open = true;
+            let mut start = false;
+            let mut stop = false;
+            let mut allow: Option<bool> = None;
+            let info = self
+                .tabs
+                .iter()
+                .find(|t| t.id == tab_id)
+                .and_then(|t| match &t.kind {
+                    TabKind::Term(tt) => Some(
+                        tt.share
+                            .as_ref()
+                            .map(|s| (s.link.to_link(), s.guests, s.allow_input)),
+                    ),
+                    _ => None,
+                });
+            egui::Window::new("🔗 Share this terminal").open(&mut open).default_width(480.0).show(ctx, |ui| {
+                match &info {
+                    Some(Some((link, guests, allow_input))) => {
+                        ui.label("Send this link to the other person (they paste it under 🔗 Join). Anyone who has it can watch, so share it privately.");
+                        let mut l = link.clone();
+                        ui.add(egui::TextEdit::singleline(&mut l).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
+                        if ui.button("Copy link").clicked() {
+                            ctx.copy_text(link.clone());
+                        }
+                        ui.label(format!("{guests} viewer(s) connected"));
+                        let mut a = *allow_input;
+                        if ui.checkbox(&mut a, "Allow viewers to type (they act as you on this server)").changed() {
+                            allow = Some(a);
+                        }
+                        if ui.button("Stop sharing").clicked() {
+                            stop = true;
+                        }
+                        ui.small("End-to-end encrypted: the key is only in the link; the relay sees ciphertext only.");
+                    }
+                    Some(None) => {
+                        ui.label("Relay server (your sshield sync Worker):");
+                        ui.add(egui::TextEdit::singleline(&mut self.share_server_in).hint_text("https://sshield-sync.you.workers.dev").desired_width(f32::INFINITY));
+                        ui.small("Viewers are read-only until you allow input. You can stop at any time.");
+                        if ui.add_enabled(self.share_server_in.trim().starts_with("https://"), egui::Button::new("Start sharing")).clicked() {
+                            start = true;
+                        }
+                        if !self.share_status.is_empty() {
+                            ui.colored_label(c(self.theme.ansi[1]), &self.share_status);
+                        }
+                    }
+                    None => {
+                        ui.label("This tab can't be shared.");
+                    }
+                }
+            });
+            if start {
+                match ShareLink::create(self.share_server_in.trim()) {
+                    Ok(link) => {
+                        self.share_status = "Connecting…".into();
+                        let (tx, ctx2) = (self.tx.clone(), self.ctx.clone());
+                        self.rt.spawn(async move {
+                            let c3 = ctx2.clone();
+                            let res = share::connect(&link, ShareRole::Host, move || {
+                                c3.request_repaint()
+                            })
+                            .await;
+                            let _ = tx.send(UiMsg::ShareStarted(tab_id, link, res));
+                            ctx2.request_repaint();
+                        });
+                    }
+                    Err(e) => self.share_status = e,
+                }
+            }
+            if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                if let TabKind::Term(tt) = &mut t.kind {
+                    if stop {
+                        if let Some(sh) = tt.share.take() {
+                            let _ = sh.conn.tx.send(ShareFrame::End);
+                        }
+                    }
+                    if let (Some(a), Some(sh)) = (allow, &mut tt.share) {
+                        sh.allow_input = a;
+                        let _ = sh.conn.tx.send(ShareFrame::Allow {
+                            allowed: a,
+                            epoch: sh.epoch,
+                        });
+                    }
+                }
+            }
+            if !open {
+                self.share_dialog = None;
+            }
+        }
+        // ---- guest: join with a link
+        if self.show_join {
+            let mut open = true;
+            egui::Window::new("🔗 Join a shared terminal")
+                .open(&mut open)
+                .default_width(480.0)
+                .show(ctx, |ui| {
+                    ui.label("Paste the link the host sent you:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.join_link_in)
+                            .hint_text("sshield://share?s=…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    let parsed = ShareLink::parse(&self.join_link_in);
+                    if ui
+                        .add_enabled(parsed.is_ok(), egui::Button::new("Join"))
+                        .clicked()
+                    {
+                        if let Ok(link) = parsed {
+                            self.share_status = "Connecting…".into();
+                            let (tx, ctx2) = (self.tx.clone(), self.ctx.clone());
+                            self.rt.spawn(async move {
+                                let c3 = ctx2.clone();
+                                let res = share::connect(&link, ShareRole::Guest, move || {
+                                    c3.request_repaint()
+                                })
+                                .await;
+                                let _ = tx.send(UiMsg::ShareJoined(res));
+                                ctx2.request_repaint();
+                            });
+                        }
+                    } else if !self.join_link_in.trim().is_empty() {
+                        if let Err(e) = ShareLink::parse(&self.join_link_in) {
+                            ui.colored_label(c(self.theme.ansi[1]), e);
+                        }
+                    }
+                    if !self.share_status.is_empty() {
+                        ui.label(&self.share_status);
+                    }
+                });
+            if !open {
+                self.show_join = false;
+            }
         }
     }
 
@@ -2195,6 +2569,7 @@ impl App {
         self.palette_window(ctx);
         self.schedules_window(ctx);
         self.agent_window(ctx);
+        self.share_windows(ctx);
         self.settings_window(ctx);
         if let Some(id) = self.confirm_delete.clone() {
             let name = self

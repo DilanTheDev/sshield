@@ -7,3 +7,12 @@ compatibility_date = "2025-01-01"
 [[kv_namespaces]]
 binding = "VAULTS"
 id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Shared terminal sessions (one Durable Object per room; free-plan compatible SQLite class)
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "Room"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
