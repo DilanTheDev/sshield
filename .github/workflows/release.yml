@@ -22,9 +22,6 @@ jobs:
           - os: ubuntu-latest
             bin: sshield
             asset: sshield-linux-x64
-          - os: macos-latest
-            bin: sshield
-            asset: sshield-macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
