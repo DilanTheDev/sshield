@@ -30,6 +30,14 @@ pub struct SessionReady {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum HomeView {
+    Hosts,
+    Keychain,
+    History,
+    Tunnels,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum SyncMode {
     /// Pull if the server is ahead (and we have no local edits), push if we have edits.
     Auto,
@@ -358,6 +366,8 @@ pub struct App {
     show_snippets: bool,
     show_schedules: bool,
     show_agent: bool,
+    home_view: HomeView,
+    history_q: String,
     compose: String,
     ctrl_armed: bool,
     show_join: bool,
@@ -451,6 +461,8 @@ impl App {
             show_snippets: false,
             show_schedules: false,
             show_agent: false,
+            home_view: HomeView::Hosts,
+            history_q: String::new(),
             compose: String::new(),
             ctrl_armed: false,
             show_join: false,
@@ -1507,6 +1519,23 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
         let k = |m: Modifiers, key: Key| KeyboardShortcut::new(m, key);
+        // Switch tabs: Ctrl+Tab / Ctrl+Shift+Tab (also Ctrl+PageDown / Ctrl+PageUp)
+        let n = self.tabs.len();
+        if n > 1 {
+            let next = ctx.input_mut(|i| {
+                i.consume_shortcut(&k(Modifiers::CTRL, Key::Tab))
+                    | i.consume_shortcut(&k(Modifiers::CTRL, Key::PageDown))
+            });
+            let prev = ctx.input_mut(|i| {
+                i.consume_shortcut(&k(Modifiers::CTRL | Modifiers::SHIFT, Key::Tab))
+                    | i.consume_shortcut(&k(Modifiers::CTRL, Key::PageUp))
+            });
+            if next {
+                self.active = (self.active + 1) % n;
+            } else if prev {
+                self.active = (self.active + n - 1) % n;
+            }
+        }
         // Font zoom: Ctrl + / Ctrl - / Ctrl 0 (like Termius)
         for m in [Modifiers::COMMAND, Modifiers::COMMAND | Modifiers::SHIFT] {
             if ctx.input_mut(|i| {
@@ -1757,12 +1786,7 @@ impl App {
             TabKind::Shared(_) => 3,
         };
         match kind_tag {
-            0 => {
-                egui::Frame::NONE
-                    .inner_margin(14.0)
-                    .show(ui, |ui| self.home(ui))
-                    .inner
-            }
+            0 => self.home_shell(ui),
             1 => self.terminal_body(ui, active),
             3 => self.shared_body(ui, active),
             _ => {
@@ -2413,6 +2437,222 @@ impl App {
                 path.display()
             )),
             Err(e) => self.toast(format!("Export failed: {e}")),
+        }
+    }
+
+    /// Termius-style home: a left navigation rail plus the selected view.
+    fn home_shell(&mut self, ui: &mut egui::Ui) {
+        let nav_bg = c(self.theme.bg);
+        egui::Panel::left("home_nav")
+            .resizable(false)
+            .exact_size(176.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(nav_bg)
+                    .inner_margin(egui::Margin::symmetric(8, 12)),
+            )
+            .show(ui, |ui| {
+                ui.label(RichText::new("🛡 sshield").strong().size(16.0));
+                ui.add_space(10.0);
+                let items = [
+                    ("🖥  Hosts", HomeView::Hosts),
+                    ("🔑  Keychain", HomeView::Keychain),
+                    ("🕘  History", HomeView::History),
+                    ("⇄  Tunnels", HomeView::Tunnels),
+                ];
+                for (label, view) in items {
+                    let sel = self.home_view == view;
+                    let r = ui.add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::Button::new(RichText::new(label).size(14.0))
+                            .selected(sel)
+                            .fill(if sel {
+                                c(self.theme.selection).gamma_multiply(0.7)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            }),
+                    );
+                    if r.clicked() {
+                        self.home_view = view;
+                    }
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                for (label, which) in [
+                    ("{ }  Snippets", 0),
+                    ("⏰  Schedules", 1),
+                    ("🤖  Agent", 2),
+                    ("⚙  Settings", 3),
+                ] {
+                    let r = ui.add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::Button::new(RichText::new(label).size(14.0))
+                            .fill(egui::Color32::TRANSPARENT),
+                    );
+                    if r.clicked() {
+                        match which {
+                            0 => self.show_snippets = !self.show_snippets,
+                            1 => self.show_schedules = !self.show_schedules,
+                            2 => self.show_agent = !self.show_agent,
+                            _ => self.show_settings = !self.show_settings,
+                        }
+                    }
+                }
+            });
+        egui::Frame::NONE
+            .inner_margin(14.0)
+            .show(ui, |ui| match self.home_view {
+                HomeView::Hosts => self.home(ui),
+                HomeView::Keychain => {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.settings_keys(ui));
+                }
+                HomeView::History => self.history_view(ui),
+                HomeView::Tunnels => self.tunnels_view(ui),
+            });
+    }
+
+    /// Every command you have run in a terminal (what autocomplete learns from).
+    fn history_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Command history");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.history_q)
+                .hint_text("🔍 Filter history…")
+                .desired_width(360.0),
+        );
+        let q = self.history_q.to_lowercase();
+        let rows: Vec<(usize, String)> = self
+            .lib
+            .history
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, c)| q.is_empty() || c.to_lowercase().contains(&q))
+            .take(500)
+            .map(|(i, c)| (i, c.clone()))
+            .collect();
+        if rows.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                "Nothing here yet. Commands you type in a terminal show up here, newest first.",
+            );
+        }
+        let mut delete: Option<usize> = None;
+        let mut save: Option<String> = None;
+        let mut clear_all = false;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, cmd) in &rows {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(RichText::new(cmd).monospace()).truncate());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("🗑").on_hover_text("Delete").clicked() {
+                                delete = Some(*i);
+                            }
+                            if ui
+                                .small_button("{ } Save")
+                                .on_hover_text("Save as snippet")
+                                .clicked()
+                            {
+                                save = Some(cmd.clone());
+                            }
+                            if ui.small_button("Copy").clicked() {
+                                ui.ctx().copy_text(cmd.clone());
+                            }
+                        });
+                    });
+                }
+                if !rows.is_empty() {
+                    ui.add_space(8.0);
+                    if ui.button("Clear all history").clicked() {
+                        clear_all = true;
+                    }
+                }
+            });
+        if let Some(i) = delete {
+            self.mutate(|l| {
+                if i < l.history.len() {
+                    l.history.remove(i);
+                }
+            });
+        }
+        if let Some(cmd) = save {
+            self.mutate(|l| {
+                l.snippets.push(Snippet {
+                    id: new_id(),
+                    name: cmd.chars().take(32).collect(),
+                    command: cmd,
+                    tags: vec![],
+                })
+            });
+            self.toast("Saved as a snippet");
+        }
+        if clear_all {
+            self.mutate(|l| l.history.clear());
+        }
+    }
+
+    /// Port forwards: the ones saved on hosts, and the ones live right now.
+    fn tunnels_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Tunnels");
+        ui.label("Port forwards start automatically when you connect to a host that has them. Edit a host to add or change them.");
+        ui.add_space(8.0);
+        let mut live: Vec<String> = vec![];
+        for t in &self.tabs {
+            if let TabKind::Term(tt) = &t.kind {
+                for f in &tt.forwards {
+                    let n = f.connections.load(std::sync::atomic::Ordering::Relaxed);
+                    live.push(format!(
+                        "{}  ·  {}  ({} connections)",
+                        tt.host.label,
+                        describe_forward(&f.spec, f.bound_port),
+                        n
+                    ));
+                }
+            }
+        }
+        ui.label(RichText::new(format!("● Live now ({})", live.len())).strong());
+        if live.is_empty() {
+            ui.small("No active tunnels. Connect to a host with forwards to start them.");
+        }
+        for l in &live {
+            ui.label(RichText::new(l).monospace());
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new("Saved on hosts").strong());
+        let mut connect: Option<Host> = None;
+        let mut any = false;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for h in self.lib.hosts.iter().filter(|h| !h.forwards.is_empty()) {
+                    any = true;
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(&h.label);
+                            ui.label(
+                                RichText::new(format!("{}@{}", h.username, h.hostname)).weak(),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Connect & start").clicked() {
+                                    connect = Some(h.clone());
+                                }
+                            });
+                        });
+                        for f in &h.forwards {
+                            ui.label(RichText::new(describe_forward(f, f.bind_port)).monospace());
+                        }
+                    });
+                }
+            });
+        if !any {
+            ui.small("No host has port forwards yet.");
+        }
+        if let Some(h) = connect {
+            self.open_host(h);
         }
     }
 
@@ -3635,6 +3875,31 @@ impl App {
     }
 }
 
+fn describe_forward(f: &PortForward, port: u16) -> String {
+    match f.kind {
+        ForwardKind::Local => format!(
+            "L  {}:{} → {}:{}",
+            f.bind_host, port, f.dest_host, f.dest_port
+        ),
+        ForwardKind::Remote => format!(
+            "R  {}:{} → {}:{}",
+            f.bind_host, port, f.dest_host, f.dest_port
+        ),
+        ForwardKind::Dynamic => format!("SOCKS5  {}:{}", f.bind_host, port),
+    }
+}
+
+/// Stable colour for a host's avatar circle.
+fn avatar_color(name: &str) -> egui::Color32 {
+    const P: [u32; 8] = [
+        0x4f8cff, 0x5ad19a, 0xf5c26b, 0xb48cff, 0xff6b81, 0x4fd1e0, 0xe08a4f, 0x8bc34a,
+    ];
+    let h = name
+        .bytes()
+        .fold(7u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    c(P[(h as usize) % P.len()])
+}
+
 fn host_grid(
     ui: &mut egui::Ui,
     hosts: &[&Host],
@@ -3657,6 +3922,21 @@ fn host_grid(
                     ui.vertical(|ui| {
                         ui.set_width(w);
                         ui.horizontal(|ui| {
+                            let (ar, _) = ui
+                                .allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+                            ui.painter()
+                                .circle_filled(ar.center(), 15.0, avatar_color(&h.label));
+                            ui.painter().text(
+                                ar.center(),
+                                egui::Align2::CENTER_CENTER,
+                                h.label
+                                    .chars()
+                                    .next()
+                                    .map(|c| c.to_uppercase().to_string())
+                                    .unwrap_or("?".into()),
+                                egui::FontId::proportional(15.0),
+                                egui::Color32::WHITE,
+                            );
                             let title = ui.add(
                                 egui::Label::new(RichText::new(&h.label).strong().size(15.0))
                                     .truncate()
