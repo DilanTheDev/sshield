@@ -54,9 +54,15 @@ impl SyncConfig {
     }
 }
 
+/// Argon2id cost for the auth token: deliberately the same as the vault's own KDF
+/// (64 MiB, 3 passes). The server stores a hash of this token, so if it were cheaper than the
+/// vault KDF it would become the easiest way to guess a master password offline.
+const TOKEN_M_KIB: u32 = 64 * 1024;
+const TOKEN_T: u32 = 3;
+
 /// Derive the 32-byte (hex) auth token. Deterministic, so every device computes the same one.
 pub fn derive_token(password: &str, account: &str) -> Result<String, String> {
-    derive_token_with(password, account, 19 * 1024, 2)
+    derive_token_with(password, account, TOKEN_M_KIB, TOKEN_T)
 }
 
 fn derive_token_with(password: &str, account: &str, m_kib: u32, t: u32) -> Result<String, String> {
@@ -64,7 +70,8 @@ fn derive_token_with(password: &str, account: &str, m_kib: u32, t: u32) -> Resul
     if account.is_empty() {
         return Err("account name is required".into());
     }
-    let salt = format!("sshield-sync-v1|{account}");
+    // v2: stronger KDF than v1 (19 MiB / 2 passes). A different salt means v1 tokens never collide.
+    let salt = format!("sshield-sync-v2|{account}");
     let params = Params::new(m_kib, t, 1, Some(32)).map_err(|e| e.to_string())?;
     let mut out = [0u8; 32];
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
@@ -191,6 +198,12 @@ mod tests {
         assert_ne!(a, derive_token_with("pw", "other", 64, 1).unwrap());
         assert_eq!(a.len(), 64);
         assert!(derive_token_with("pw", " ", 64, 1).is_err());
+    }
+
+    #[test]
+    fn token_cost_is_not_weaker_than_the_vault_kdf() {
+        let v = crate::vault::KdfCost::STRONG;
+        assert!(TOKEN_M_KIB >= v.m_kib && TOKEN_T >= v.t);
     }
 
     #[test]
