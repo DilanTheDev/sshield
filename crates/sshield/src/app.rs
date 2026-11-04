@@ -121,6 +121,11 @@ struct ShareHost {
     allow_input: bool,
     guests: usize,
     last_size: (u16, u16),
+    /// Random per sharing session; guests must echo it in `Input`, so frames captured from any
+    /// other session (or replayed by the relay) are ignored.
+    epoch: u64,
+    /// Stale/replayed frames discarded by the relay-facing decryptor.
+    rejected: u64,
 }
 
 /// A shared terminal we joined as a guest.
@@ -130,6 +135,7 @@ struct SharedTab {
     allow_input: bool,
     closed: Option<String>,
     got_snapshot: bool,
+    epoch: Option<u64>,
 }
 
 struct TermTab {
@@ -1072,6 +1078,8 @@ impl App {
                                 allow_input: false,
                                 guests: 0,
                                 last_size: (0, 0),
+                                epoch: share::random_u64(),
+                                rejected: 0,
                             });
                         }
                         self.share_status.clear();
@@ -1090,6 +1098,7 @@ impl App {
                                 allow_input: false,
                                 closed: None,
                                 got_snapshot: false,
+                                epoch: None,
                             })),
                         );
                         self.share_status.clear();
@@ -1167,7 +1176,7 @@ impl App {
             if let TabKind::Shared(st) = &mut t.kind {
                 while let Ok(ev) = st.conn.rx.try_recv() {
                     match ev {
-                        share::Event::Frame(ShareFrame::Snapshot { cols, rows, data }) => {
+                        share::Event::Frame(ShareFrame::Snapshot { cols, rows, data }, _) => {
                             st.term.fixed = Some((cols, rows));
                             st.term.feed(b"\x1bc");
                             st.term.parser.set_size(
@@ -1177,11 +1186,21 @@ impl App {
                             st.term.feed(&data);
                             st.got_snapshot = true;
                         }
-                        share::Event::Frame(ShareFrame::Output(d)) if st.got_snapshot => {
-                            st.term.feed(&d)
+                        // Output is only applied when it directly follows the previous host frame.
+                        // A gap (dropped/reordered by the relay) discards the view and asks for a
+                        // fresh snapshot instead of silently showing a wrong screen.
+                        share::Event::Frame(ShareFrame::Output(d), meta) => {
+                            if st.got_snapshot && meta.in_order {
+                                st.term.feed(&d);
+                            } else {
+                                st.got_snapshot = false;
+                            }
                         }
-                        share::Event::Frame(ShareFrame::Allow(b)) => st.allow_input = b,
-                        share::Event::Frame(ShareFrame::End) => {
+                        share::Event::Frame(ShareFrame::Allow { allowed, epoch }, _) => {
+                            st.allow_input = allowed;
+                            st.epoch = Some(epoch);
+                        }
+                        share::Event::Frame(ShareFrame::End, _) => {
                             st.closed = Some("The host ended the session.".into())
                         }
                         share::Event::Closed(r) => {
@@ -1235,7 +1254,10 @@ impl App {
                             rows,
                             data: term.parser.screen().state_formatted().into(),
                         });
-                        let _ = sh.conn.tx.send(ShareFrame::Allow(sh.allow_input));
+                        let _ = sh.conn.tx.send(ShareFrame::Allow {
+                            allowed: sh.allow_input,
+                            epoch: sh.epoch,
+                        });
                     };
                     if size != sh.last_size {
                         sh.last_size = size;
@@ -1243,12 +1265,18 @@ impl App {
                     }
                     while let Ok(ev) = sh.conn.rx.try_recv() {
                         match ev {
-                            share::Event::Frame(ShareFrame::Hello) => snap(sh, &tt.term),
-                            share::Event::Frame(ShareFrame::Input(d)) if sh.allow_input => {
+                            share::Event::Frame(ShareFrame::Hello, _) => snap(sh, &tt.term),
+                            // Keystrokes are only accepted when input is on, they belong to this
+                            // session (epoch) and nothing before them was dropped, replayed or
+                            // reordered (in_order). Anything else is ignored.
+                            share::Event::Frame(ShareFrame::Input { epoch, data }, meta)
+                                if sh.allow_input && epoch == sh.epoch && meta.in_order =>
+                            {
                                 if let Some(tx) = &tt.tx {
-                                    let _ = tx.send(ShellCmd::Input(d));
+                                    let _ = tx.send(ShellCmd::Input(data));
                                 }
                             }
+                            share::Event::Rejected(n) => sh.rejected = n,
                             share::Event::Guests(n) => sh.guests = n,
                             share::Event::Closed(r) => share_ended = Some(r),
                             _ => {}
@@ -1825,7 +1853,7 @@ impl App {
                                     sftp_host = Some(tt.host.clone());
                                 }
                                 if let Some(sh) = &tt.share {
-                                ui.colored_label(c(theme.ansi[1]), format!("● SHARING · {} viewer(s){}", sh.guests, if sh.allow_input { " · input ON" } else { "" }));
+                                ui.colored_label(c(theme.ansi[1]), format!("● SHARING · {} viewer(s){}{}", sh.guests, if sh.allow_input { " · input ON" } else { "" }, if sh.rejected > 0 { format!(" · ⚠ {} replayed frame(s) blocked", sh.rejected) } else { String::new() }));
                             }
                             if ui.small_button(if tt.share.is_some() { "🔗 Sharing…" } else { "🔗 Share" }).on_hover_text("Let another sshield user watch (and, if you allow, type in) this terminal").clicked() {
                                 share_dialog = true;
@@ -2102,8 +2130,13 @@ impl App {
                 });
             });
         let out = st.term.show(ui, &theme, &settings, true);
-        if st.allow_input && st.closed.is_none() && !out.input.is_empty() {
-            let _ = st.conn.tx.send(ShareFrame::Input(out.input));
+        if let (true, None, Some(epoch), false) =
+            (st.allow_input, &st.closed, st.epoch, out.input.is_empty())
+        {
+            let _ = st.conn.tx.send(ShareFrame::Input {
+                epoch,
+                data: out.input,
+            });
         }
         if !st.got_snapshot && st.closed.is_none() {
             // ask the host for the screen until it arrives (cheap; throttled by repaint)
@@ -2195,7 +2228,10 @@ impl App {
                     }
                     if let (Some(a), Some(sh)) = (allow, &mut tt.share) {
                         sh.allow_input = a;
-                        let _ = sh.conn.tx.send(ShareFrame::Allow(a));
+                        let _ = sh.conn.tx.send(ShareFrame::Allow {
+                            allowed: a,
+                            epoch: sh.epoch,
+                        });
                     }
                 }
             }

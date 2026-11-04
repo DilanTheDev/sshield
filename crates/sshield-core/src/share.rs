@@ -109,10 +109,12 @@ pub enum Frame {
     Output(Vec<u8>),
     /// host -> guests: full screen state + grid size
     Snapshot { cols: u16, rows: u16, data: Vec<u8> },
-    /// guest -> host: keystrokes (ignored by the host unless input is allowed)
-    Input(Vec<u8>),
-    /// host -> guests: whether typing is currently allowed
-    Allow(bool),
+    /// guest -> host: keystrokes. `epoch` must equal the host's current epoch (learned from
+    /// `Allow`), so frames captured in any other host session are useless. The host ignores
+    /// input unless it is currently allowed.
+    Input { epoch: u64, data: Vec<u8> },
+    /// host -> guests: whether typing is currently allowed, plus the host's session epoch
+    Allow { allowed: bool, epoch: u64 },
     /// guest -> host: "send me the screen"
     Hello,
     /// host -> guests: the session is over
@@ -126,59 +128,36 @@ fn aad(room: &str, sender: Role) -> Vec<u8> {
     a
 }
 
-pub fn seal(link: &ShareLink, sender: Role, f: &Frame) -> Result<Vec<u8>, String> {
-    let mut pt = Vec::new();
+fn encode(f: &Frame, out: &mut Vec<u8>) {
     match f {
         Frame::Output(d) => {
-            pt.push(1);
-            pt.extend_from_slice(d);
+            out.push(1);
+            out.extend_from_slice(d);
         }
         Frame::Snapshot { cols, rows, data } => {
-            pt.push(2);
-            pt.extend_from_slice(&cols.to_be_bytes());
-            pt.extend_from_slice(&rows.to_be_bytes());
-            pt.extend_from_slice(data);
+            out.push(2);
+            out.extend_from_slice(&cols.to_be_bytes());
+            out.extend_from_slice(&rows.to_be_bytes());
+            out.extend_from_slice(data);
         }
-        Frame::Input(d) => {
-            pt.push(3);
-            pt.extend_from_slice(d);
+        Frame::Input { epoch, data } => {
+            out.push(3);
+            out.extend_from_slice(&epoch.to_be_bytes());
+            out.extend_from_slice(data);
         }
-        Frame::Allow(b) => pt.extend_from_slice(&[4, *b as u8]),
-        Frame::Hello => pt.push(5),
-        Frame::End => pt.push(6),
+        Frame::Allow { allowed, epoch } => {
+            out.extend_from_slice(&[4, *allowed as u8]);
+            out.extend_from_slice(&epoch.to_be_bytes());
+        }
+        Frame::Hello => out.push(5),
+        Frame::End => out.push(6),
     }
-    let mut nonce = [0u8; 24];
-    getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
-    let ct = XChaCha20Poly1305::new((&link.key).into())
-        .encrypt(
-            (&nonce).into(),
-            Payload {
-                msg: &pt,
-                aad: &aad(&link.room, sender),
-            },
-        )
-        .map_err(|e| e.to_string())?;
-    let mut out = nonce.to_vec();
-    out.extend_from_slice(&ct);
-    Ok(out)
 }
 
-pub fn open(link: &ShareLink, sender: Role, wire: &[u8]) -> Result<Frame, String> {
-    if wire.len() < 24 + 16 + 1 {
-        return Err("short frame".into());
-    }
-    let (nonce, ct) = wire.split_at(24);
-    let nonce: [u8; 24] = nonce.try_into().map_err(|_| "nonce")?;
-    let pt = XChaCha20Poly1305::new((&link.key).into())
-        .decrypt(
-            (&nonce).into(),
-            Payload {
-                msg: ct,
-                aad: &aad(&link.room, sender),
-            },
-        )
-        .map_err(|_| "frame failed authentication".to_string())?;
+fn decode(pt: &[u8]) -> Result<Frame, String> {
     let (t, rest) = pt.split_first().ok_or("empty frame")?;
+    let u64_at =
+        |b: &[u8]| -> Option<u64> { Some(u64::from_be_bytes(b.get(..8)?.try_into().ok()?)) };
     Ok(match t {
         1 => Frame::Output(rest.to_vec()),
         2 if rest.len() >= 4 => Frame::Snapshot {
@@ -186,17 +165,139 @@ pub fn open(link: &ShareLink, sender: Role, wire: &[u8]) -> Result<Frame, String
             rows: u16::from_be_bytes([rest[2], rest[3]]),
             data: rest[4..].to_vec(),
         },
-        3 => Frame::Input(rest.to_vec()),
-        4 if !rest.is_empty() => Frame::Allow(rest[0] != 0),
+        3 => Frame::Input {
+            epoch: u64_at(rest).ok_or("short input frame")?,
+            data: rest[8..].to_vec(),
+        },
+        4 if rest.len() >= 9 => Frame::Allow {
+            allowed: rest[0] != 0,
+            epoch: u64_at(&rest[1..]).ok_or("short allow frame")?,
+        },
         5 => Frame::Hello,
         6 => Frame::End,
         _ => return Err("unknown frame".into()),
     })
 }
 
+/// A random value for session epochs / sender ids.
+pub fn random_u64() -> u64 {
+    let mut b = [0u8; 8];
+    let _ = getrandom::fill(&mut b);
+    u64::from_be_bytes(b)
+}
+
+/// Seals outgoing frames. Every frame carries this connection's random sender id and a strictly
+/// increasing counter *inside* the authenticated plaintext, so a relay that captures a frame can
+/// neither replay it nor slip it into a different position without the receiver noticing.
+pub struct Sealer {
+    link: ShareLink,
+    role: Role,
+    id: [u8; 8],
+    counter: u64,
+}
+
+impl Sealer {
+    pub fn new(link: &ShareLink, role: Role) -> Sealer {
+        Sealer {
+            link: link.clone(),
+            role,
+            id: random_u64().to_be_bytes(),
+            counter: 0,
+        }
+    }
+
+    pub fn seal(&mut self, f: &Frame) -> Result<Vec<u8>, String> {
+        let mut pt = Vec::with_capacity(32);
+        pt.extend_from_slice(&self.id);
+        pt.extend_from_slice(&self.counter.to_be_bytes());
+        encode(f, &mut pt);
+        self.counter += 1;
+        let mut nonce = [0u8; 24];
+        getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
+        let ct = XChaCha20Poly1305::new((&self.link.key).into())
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: &pt,
+                    aad: &aad(&self.link.room, self.role),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Meta {
+    pub sender: [u8; 8],
+    /// True only for a sender we have already seen and whose counter is exactly the previous
+    /// one + 1 - i.e. nothing was dropped, reordered or injected before this frame.
+    pub in_order: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum OpenError {
+    /// Failed authentication (wrong key, wrong sender role, or tampered).
+    Invalid,
+    /// Authentic but already seen / older than one already accepted: a replay.
+    Replay,
+}
+
+/// Opens incoming frames from `peer` and enforces freshness.
+pub struct Opener {
+    link: ShareLink,
+    peer: Role,
+    seen: std::collections::HashMap<[u8; 8], u64>,
+}
+
+const MAX_SENDERS: usize = 64;
+
+impl Opener {
+    pub fn new(link: &ShareLink, peer: Role) -> Opener {
+        Opener {
+            link: link.clone(),
+            peer,
+            seen: Default::default(),
+        }
+    }
+
+    pub fn open(&mut self, wire: &[u8]) -> Result<(Frame, Meta), OpenError> {
+        if wire.len() < 24 + 16 + 17 {
+            return Err(OpenError::Invalid);
+        }
+        let (nonce, ct) = wire.split_at(24);
+        let nonce: [u8; 24] = nonce.try_into().map_err(|_| OpenError::Invalid)?;
+        let pt = XChaCha20Poly1305::new((&self.link.key).into())
+            .decrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: ct,
+                    aad: &aad(&self.link.room, self.peer),
+                },
+            )
+            .map_err(|_| OpenError::Invalid)?;
+        let sender: [u8; 8] = pt[..8].try_into().map_err(|_| OpenError::Invalid)?;
+        let counter = u64::from_be_bytes(pt[8..16].try_into().map_err(|_| OpenError::Invalid)?);
+        let in_order = match self.seen.get(&sender) {
+            Some(&last) if counter <= last => return Err(OpenError::Replay),
+            Some(&last) => counter == last + 1,
+            None if self.seen.len() >= MAX_SENDERS => return Err(OpenError::Invalid),
+            None => false,
+        };
+        let frame = decode(&pt[16..]).map_err(|_| OpenError::Invalid)?;
+        // only advance after the frame authenticated and parsed
+        self.seen.insert(sender, counter);
+        Ok((frame, Meta { sender, in_order }))
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
-    Frame(Frame),
+    Frame(Frame, Meta),
+    /// A replayed (or otherwise stale) frame was discarded; carries the running count.
+    Rejected(u64),
     /// Number of guests currently connected (host side only).
     Guests(usize),
     Closed(String),
@@ -235,21 +336,24 @@ pub async fn connect(
             Role::Host
         },
     );
-    let link = link.clone();
+    let mut sealer = Sealer::new(link, me);
+    let mut opener = Opener::new(link, peer);
+    let mut rejected = 0u64;
     tokio::spawn(async move {
         let reason = loop {
             tokio::select! {
                 out = frx.recv() => match out {
-                    Some(f) => match seal(&link, me, &f) {
+                    Some(f) => match sealer.seal(&f) {
                         Ok(b) => if sink.send(Message::Binary(b.into())).await.is_err() { break "connection lost".to_string() },
                         Err(e) => break e,
                     },
                     None => break "closed".to_string(),
                 },
                 msg = stream.next() => match msg {
-                    Some(Ok(Message::Binary(b))) => match open(&link, peer, &b) {
-                        Ok(f) => { let _ = etx.send(Event::Frame(f)); }
-                        Err(e) => { if std::env::var("SSHIELD_DEBUG").is_ok() { eprintln!("share: dropped frame: {e}"); } }
+                    Some(Ok(Message::Binary(b))) => match opener.open(&b) {
+                        Ok((f, meta)) => { let _ = etx.send(Event::Frame(f, meta)); }
+                        Err(OpenError::Replay) => { rejected += 1; let _ = etx.send(Event::Rejected(rejected)); }
+                        Err(OpenError::Invalid) => {} // not from our peer / wrong key
                     },
                     Some(Ok(Message::Text(t))) => {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
@@ -298,32 +402,87 @@ mod tests {
     #[test]
     fn frames_roundtrip_and_resist_tampering() {
         let l = ShareLink::create("https://r.example").unwrap();
-        for f in [
+        let frames = [
             Frame::Output(b"ls\r\n".to_vec()),
             Frame::Snapshot {
                 cols: 80,
                 rows: 24,
                 data: b"x".to_vec(),
             },
-            Frame::Input(b"a".to_vec()),
-            Frame::Allow(true),
+            Frame::Input {
+                epoch: 7,
+                data: b"a".to_vec(),
+            },
+            Frame::Allow {
+                allowed: true,
+                epoch: 9,
+            },
             Frame::Hello,
             Frame::End,
-        ] {
-            let w = seal(&l, Role::Host, &f).unwrap();
-            assert_eq!(open(&l, Role::Host, &w).unwrap(), f);
-            // a frame sealed by the host must not verify as coming from a guest (no reflection)
-            assert!(open(&l, Role::Guest, &w).is_err());
+        ];
+        let mut sealer = Sealer::new(&l, Role::Host);
+        let mut opener = Opener::new(&l, Role::Host);
+        let mut wires = vec![];
+        for f in &frames {
+            let w = sealer.seal(f).unwrap();
+            let (got, _) = opener.open(&w).unwrap();
+            assert_eq!(&got, f);
+            // a host-sealed frame must not verify as coming from a guest (no reflection)
+            assert_eq!(
+                Opener::new(&l, Role::Guest).open(&w).unwrap_err(),
+                OpenError::Invalid
+            );
             let mut bad = w.clone();
             *bad.last_mut().unwrap() ^= 1;
-            assert!(open(&l, Role::Host, &bad).is_err());
+            assert_eq!(
+                Opener::new(&l, Role::Host).open(&bad).unwrap_err(),
+                OpenError::Invalid
+            );
+            wires.push(w);
         }
         let other = ShareLink::create("https://r.example").unwrap();
-        assert!(open(
-            &other,
-            Role::Host,
-            &seal(&l, Role::Host, &Frame::Hello).unwrap()
-        )
-        .is_err());
+        assert_eq!(
+            Opener::new(&other, Role::Host).open(&wires[0]).unwrap_err(),
+            OpenError::Invalid
+        );
+    }
+
+    #[test]
+    fn replayed_frames_are_rejected() {
+        let l = ShareLink::create("https://r.example").unwrap();
+        let mut guest = Sealer::new(&l, Role::Guest);
+        let mut host_rx = Opener::new(&l, Role::Guest);
+        let hello = guest.seal(&Frame::Hello).unwrap();
+        let keys = guest
+            .seal(&Frame::Input {
+                epoch: 1,
+                data: b"rm -rf build\r".to_vec(),
+            })
+            .unwrap();
+        assert!(host_rx.open(&hello).is_ok());
+        assert!(host_rx.open(&keys).is_ok());
+        // the relay re-sends the captured keystrokes: authentic, but stale
+        assert_eq!(host_rx.open(&keys).unwrap_err(), OpenError::Replay);
+        assert_eq!(host_rx.open(&hello).unwrap_err(), OpenError::Replay);
+        // a fresh receiver (e.g. after the host restarts) still can't be fed the same frame as
+        // in-order input, because the sender is unknown there (in_order == false)
+        let (_, meta) = Opener::new(&l, Role::Guest).open(&keys).unwrap();
+        assert!(!meta.in_order);
+    }
+
+    #[test]
+    fn drops_and_reordering_are_detected() {
+        let l = ShareLink::create("https://r.example").unwrap();
+        let mut host = Sealer::new(&l, Role::Host);
+        let mut guest_rx = Opener::new(&l, Role::Host);
+        let w: Vec<_> = (0..4)
+            .map(|i| host.seal(&Frame::Output(vec![i])).unwrap())
+            .collect();
+        assert!(!guest_rx.open(&w[0]).unwrap().1.in_order); // first sight: baseline only
+        assert!(guest_rx.open(&w[1]).unwrap().1.in_order);
+        // w[2] dropped by the relay -> gap is visible on w[3]
+        assert!(!guest_rx.open(&w[3]).unwrap().1.in_order);
+        // and delivering the dropped one late is refused as stale
+        assert_eq!(guest_rx.open(&w[2]).unwrap_err(), OpenError::Replay);
     }
 }

@@ -38,7 +38,7 @@ async fn host_and_guest_exchange_encrypted_frames() {
 
     guest.tx.send(Frame::Hello).unwrap();
     wait(&host.rx, |e| {
-        matches!(e, Event::Frame(Frame::Hello)).then_some(())
+        matches!(e, Event::Frame(Frame::Hello, _)).then_some(())
     });
     host.tx
         .send(Frame::Snapshot {
@@ -47,28 +47,53 @@ async fn host_and_guest_exchange_encrypted_frames() {
             data: b"\x1b[2Jhello".to_vec(),
         })
         .unwrap();
-    host.tx.send(Frame::Allow(true)).unwrap();
+    host.tx
+        .send(Frame::Allow {
+            allowed: true,
+            epoch: 42,
+        })
+        .unwrap();
     host.tx.send(Frame::Output(b"world".to_vec())).unwrap();
     wait(&guest.rx, |e| {
         matches!(
             e,
-            Event::Frame(Frame::Snapshot {
-                cols: 100,
-                rows: 30,
-                ..
-            })
+            Event::Frame(
+                Frame::Snapshot {
+                    cols: 100,
+                    rows: 30,
+                    ..
+                },
+                _
+            )
         )
         .then_some(())
     });
     wait(&guest.rx, |e| {
-        matches!(e, Event::Frame(Frame::Allow(true))).then_some(())
+        matches!(
+            e,
+            Event::Frame(
+                Frame::Allow {
+                    allowed: true,
+                    epoch: 42
+                },
+                _
+            )
+        )
+        .then_some(())
     });
     wait(&guest.rx, |e| {
-        matches!(e, Event::Frame(Frame::Output(ref d)) if d == b"world").then_some(())
+        matches!(e, Event::Frame(Frame::Output(ref d), m) if d == b"world" && m.in_order)
+            .then_some(())
     });
-    guest.tx.send(Frame::Input(b"ls\r".to_vec())).unwrap();
+    guest
+        .tx
+        .send(Frame::Input {
+            epoch: 42,
+            data: b"ls\r".to_vec(),
+        })
+        .unwrap();
     wait(&host.rx, |e| {
-        matches!(e, Event::Frame(Frame::Input(ref d)) if d == b"ls\r").then_some(())
+        matches!(e, Event::Frame(Frame::Input { epoch: 42, ref data }, m) if data == b"ls\r" && m.in_order).then_some(())
     });
 
     // an impostor with the wrong host secret is refused
@@ -78,8 +103,54 @@ async fn host_and_guest_exchange_encrypted_frames() {
 
     host.tx.send(Frame::End).unwrap();
     wait(&guest.rx, |e| {
-        matches!(e, Event::Frame(Frame::End)).then_some(())
+        matches!(e, Event::Frame(Frame::End, _)).then_some(())
     });
     drop(host);
     wait(&guest.rx, |e| matches!(e, Event::Closed(_)).then_some(()));
+}
+
+/// A relay that re-sends a captured keystroke frame must not get it executed twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_replay_of_input_is_rejected() {
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let Ok(server) = std::env::var("SSHIELD_RELAY") else {
+        return;
+    };
+    let link = ShareLink::create(&server).unwrap();
+    let host = connect(&link, Role::Host, || {}).await.unwrap();
+
+    // raw guest socket so the test can send the very same ciphertext twice (what a hostile relay would do)
+    let url = format!(
+        "{}/v1/room/{}?role=guest",
+        server.replacen("http", "ws", 1),
+        link.room
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .unwrap();
+    let mut sealer = Sealer::new(&link, Role::Guest);
+    for f in [
+        Frame::Hello,
+        Frame::Input {
+            epoch: 5,
+            data: b"reboot\r".to_vec(),
+        },
+    ] {
+        let wire = sealer.seal(&f).unwrap();
+        ws.send(Message::Binary(wire.clone().into())).await.unwrap();
+        if matches!(f, Frame::Input { .. }) {
+            ws.send(Message::Binary(wire.into())).await.unwrap(); // replay
+        }
+    }
+    let mut inputs = 0;
+    let mut rejected = 0;
+    while let Ok(ev) = host.rx.recv_timeout(Duration::from_secs(2)) {
+        match ev {
+            Event::Frame(Frame::Input { .. }, m) if m.in_order => inputs += 1,
+            Event::Rejected(n) => rejected = n,
+            _ => {}
+        }
+    }
+    assert_eq!((inputs, rejected), (1, 1));
 }
