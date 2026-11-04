@@ -3272,7 +3272,7 @@ impl App {
             ui.end_row();
         });
         ui.add_space(6.0);
-        ui.small("Starting a tunnel needs administrator/root rights (WireGuard service install on Windows, wg-quick/openvpn on Linux/macOS). If you'd rather not run sshield elevated, start the VPN yourself and choose “Already running”.");
+        ui.small("Starting a tunnel needs administrator/root rights (WireGuard service install on Windows, wg-quick/openvpn on Linux). If you'd rather not run sshield elevated, start the VPN yourself and choose “Already running”.");
         ui.small("Hostnames are resolved by the system resolver before the connection is pinned; use IP addresses or VPN-provided DNS if DNS leakage matters.");
         ui.separator();
         ui.horizontal(|ui| {
