@@ -1,3 +1,4 @@
+use crate::agent;
 use crate::sftp_view::SftpTab;
 use crate::term::TermView;
 use crate::theme::{self, c, Theme};
@@ -73,7 +74,8 @@ enum UiMsg {
     Update(Result<Option<crate::update::Release>, String>, bool),
     Sync(SyncMsg),
     ScheduleDone(Id, u64, String),
-    AgentDone(Result<String, String>),
+    Agent(u64, agent::Event),
+    AgentDetected(agent::Provider, Option<String>),
     ShareStarted(u64, ShareLink, Result<share::Connection, String>),
     ShareJoined(Result<share::Connection, String>),
     /// Installer launched (Ok) or failed.
@@ -324,6 +326,49 @@ enum Action {
     Favorite(Id),
 }
 
+struct ChatMsg {
+    user: bool,
+    error: bool,
+    text: String,
+    /// What was attached to a user message (shown as a small note).
+    note: String,
+}
+
+/// State of the docked coding-agent sidebar.
+struct AgentUi {
+    provider: agent::Provider,
+    input: String,
+    msgs: Vec<ChatMsg>,
+    session: Option<String>,
+    running: Option<agent::Running>,
+    /// Bumped per question so late events from a stopped run are ignored.
+    turn: u64,
+    /// None = not checked yet, Some(None) = CLI not found, Some(Some(v)) = installed.
+    installed: Option<Option<String>>,
+    detect_started: bool,
+    ctx_screen: bool,
+    selection: Option<String>,
+    focus_input: bool,
+}
+
+impl AgentUi {
+    fn new() -> Self {
+        AgentUi {
+            provider: agent::Provider::Claude,
+            input: String::new(),
+            msgs: vec![],
+            session: None,
+            running: None,
+            turn: 0,
+            installed: None,
+            detect_started: false,
+            ctx_screen: true,
+            selection: None,
+            focus_input: false,
+        }
+    }
+}
+
 pub struct App {
     rt: tokio::runtime::Handle,
     ctx: egui::Context,
@@ -375,11 +420,7 @@ pub struct App {
     share_server_in: String,
     join_link_in: String,
     share_status: String,
-    agent_kind: u8,
-    agent_prompt: String,
-    agent_ctx: bool,
-    agent_out: String,
-    agent_busy: bool,
+    agent: AgentUi,
     sched_running: Vec<Id>,
     sched_name: String,
     sched_host: usize,
@@ -470,11 +511,7 @@ impl App {
             share_server_in: String::new(),
             join_link_in: String::new(),
             share_status: String::new(),
-            agent_kind: 0,
-            agent_prompt: String::new(),
-            agent_ctx: true,
-            agent_out: String::new(),
-            agent_busy: false,
+            agent: AgentUi::new(),
             sched_running: vec![],
             sched_name: String::new(),
             sched_host: 0,
@@ -1122,9 +1159,15 @@ impl App {
                     }
                     Err(e) => self.share_status = format!("Could not join: {e}"),
                 },
-                UiMsg::AgentDone(r) => {
-                    self.agent_busy = false;
-                    self.agent_out = r.unwrap_or_else(|e| format!("⚠ {e}"));
+                UiMsg::Agent(turn, ev) => {
+                    if turn == self.agent.turn {
+                        self.agent_event(ev)
+                    }
+                }
+                UiMsg::AgentDetected(p, v) => {
+                    if p == self.agent.provider {
+                        self.agent.installed = Some(v);
+                    }
                 }
                 UiMsg::ScheduleDone(id, at, result) => {
                     self.sched_running.retain(|x| *x != id);
@@ -1419,6 +1462,7 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
         self.top_bar(ui);
         self.status_bar(ui);
+        self.agent_panel(ui);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(c(self.theme.bg)))
             .show(ui, |ui| self.tab_body(ui));
@@ -1519,6 +1563,11 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
         let k = |m: Modifiers, key: Key| KeyboardShortcut::new(m, key);
+        if ctx.input_mut(|i| i.consume_shortcut(&k(Modifiers::COMMAND | Modifiers::SHIFT, Key::A)))
+        {
+            self.show_agent = !self.show_agent;
+            self.agent.focus_input = self.show_agent;
+        }
         // Switch tabs: Ctrl+Tab / Ctrl+Shift+Tab (also Ctrl+PageDown / Ctrl+PageUp)
         let n = self.tabs.len();
         if n > 1 {
@@ -1837,6 +1886,7 @@ impl App {
         let mut sftp_host: Option<Host> = None;
         let mut stop_fwd: Option<usize> = None;
         let mut share_dialog = false;
+        let mut ask_selection: Option<String> = None;
         let mut mobile_bytes: Vec<u8> = vec![];
         let mobile = cfg!(target_os = "android");
         let (mut compose, mut ctrl_armed) = (std::mem::take(&mut self.compose), self.ctrl_armed);
@@ -1926,6 +1976,9 @@ impl App {
                     }
                     let mut out = tt.term.show(ui, &theme, &settings, true);
                     out.input.append(&mut mobile_bytes);
+                    if let Some(sel) = out.ask_agent.take() {
+                        ask_selection = Some(sel);
+                    }
                     zoom = out.zoom;
                     if let Some(l) = out.submitted {
                         submitted = Some(l);
@@ -1955,6 +2008,14 @@ impl App {
         }
         if broadcast && !input_out.is_empty() {
             self.send_to_all(&input_out);
+        }
+        if let Some(sel) = ask_selection {
+            self.agent.selection = Some(sel);
+            self.show_agent = true;
+            self.agent.focus_input = true;
+            if self.agent.input.trim().is_empty() {
+                self.agent.input = "Explain this and tell me what to do.".into();
+            }
         }
         self.compose = compose;
         self.ctrl_armed = ctrl_armed;
@@ -2072,72 +2133,360 @@ impl App {
         self.ctx.request_repaint_after(Duration::from_secs(15));
     }
 
+    /// Last lines of the active terminal's screen, for agent context.
+    fn agent_screen_context(&self) -> Option<String> {
+        let text = self.active_screen_text()?;
+        let lines: Vec<&str> = text.lines().map(|l| l.trim_end()).collect();
+        let end = lines
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let start = end.saturating_sub(60);
+        let out = lines[start..end].join("\n");
+        (!out.trim().is_empty()).then_some(out)
+    }
+
+    fn agent_event(&mut self, ev: agent::Event) {
+        match ev {
+            agent::Event::Session(id) => self.agent.session = Some(id),
+            agent::Event::Text(t) => match self.agent.msgs.last_mut() {
+                Some(m) if !m.user && !m.error => m.text.push_str(&t),
+                _ => self.agent.msgs.push(ChatMsg {
+                    user: false,
+                    error: false,
+                    text: t,
+                    note: String::new(),
+                }),
+            },
+            agent::Event::Done { error } => {
+                self.agent.running = None;
+                if let Some(e) = error {
+                    if e == "Stopped" {
+                        if let Some(m) = self.agent.msgs.last_mut().filter(|m| !m.user) {
+                            m.text.push_str("\n\n*(stopped)*");
+                        }
+                    } else {
+                        self.agent.msgs.push(ChatMsg {
+                            user: false,
+                            error: true,
+                            text: e,
+                            note: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn agent_send(&mut self, text: String) {
+        let text = text.trim().to_string();
+        if text.is_empty() || self.agent.running.is_some() {
+            return;
+        }
+        let mut note = vec![];
+        let mut prompt = String::new();
+        let host = match self.tabs.get(self.active).map(|t| &t.kind) {
+            Some(TabKind::Term(tt)) => Some(tt.host.label.clone()),
+            _ => None,
+        };
+        if let Some(sel) = self.agent.selection.take() {
+            prompt.push_str(&format!(
+                "Selected text from the terminal:\n```\n{sel}\n```\n\n"
+            ));
+            note.push("selection");
+        }
+        if self.agent.ctx_screen {
+            if let Some(scr) = self.agent_screen_context() {
+                prompt.push_str(&format!(
+                    "Current terminal screen{}:\n```\n{scr}\n```\n\n",
+                    host.as_deref()
+                        .map(|h| format!(" ({h})"))
+                        .unwrap_or_default()
+                ));
+                note.push("screen");
+            }
+        }
+        prompt.push_str(&text);
+        self.agent.msgs.push(ChatMsg {
+            user: true,
+            error: false,
+            text,
+            note: if note.is_empty() {
+                String::new()
+            } else {
+                format!("📎 {}", note.join(" + "))
+            },
+        });
+        self.agent.turn += 1;
+        let (turn_id, tx, ctx) = (self.agent.turn, self.tx.clone(), self.ctx.clone());
+        let t = agent::Turn {
+            provider: self.agent.provider,
+            prompt,
+            host,
+            session: self.agent.session.clone(),
+        };
+        match agent::spawn(t, move |ev| {
+            let _ = tx.send(UiMsg::Agent(turn_id, ev));
+            ctx.request_repaint();
+        }) {
+            Ok(run) => self.agent.running = Some(run),
+            Err(e) => self.agent.msgs.push(ChatMsg {
+                user: false,
+                error: true,
+                text: e,
+                note: String::new(),
+            }),
+        }
+    }
+
+    /// Put a command from the agent into the active terminal (optionally pressing Enter).
+    fn agent_to_terminal(&mut self, code: &str, run: bool) {
+        let (ready, bracketed) = match self.tabs.get(self.active).map(|t| &t.kind) {
+            Some(TabKind::Term(tt)) if tt.tx.is_some() => {
+                (true, tt.term.parser.screen().bracketed_paste())
+            }
+            _ => (false, false),
+        };
+        if !ready {
+            self.toast("Open a connected terminal tab first");
+            return;
+        }
+        let code = code.trim_end();
+        let multi = code.contains('\n');
+        let mut bytes = vec![];
+        if multi && bracketed {
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(code.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+        } else if multi && !run {
+            self.toast("That's several lines: use Run, or Copy and paste it");
+            return;
+        } else {
+            bytes.extend_from_slice(code.replace('\n', "\r").as_bytes());
+        }
+        if run {
+            bytes.push(b'\r');
+        }
+        self.send_to_active(&bytes);
+    }
+
+    fn agent_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.show_agent {
+            return;
+        }
+        if !self.agent.detect_started && !cfg!(target_os = "android") {
+            self.agent.detect_started = true;
+            self.agent.installed = None;
+            let (p, tx, ctx) = (self.agent.provider, self.tx.clone(), self.ctx.clone());
+            self.rt.spawn_blocking(move || {
+                let _ = tx.send(UiMsg::AgentDetected(p, agent::detect(p)));
+                ctx.request_repaint();
+            });
+        }
+        let theme = self.theme.clone();
+        let accent = c(self.lib.settings.accent);
+        let mut close = false;
+        let mut new_chat = false;
+        let mut send: Option<String> = None;
+        let mut stop = false;
+        let mut to_term: Vec<(String, bool)> = vec![];
+        let mut switch_to: Option<agent::Provider> = None;
+        egui::Panel::right("agent_panel")
+            .resizable(true)
+            .default_size(400.0)
+            .size_range(300.0..=900.0)
+            .frame(egui::Frame::NONE.fill(c(theme.bg)).inner_margin(egui::Margin::symmetric(10, 8)))
+            .show(ui, |ui| {
+                // ---- header
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("🤖 Agent").strong().size(16.0));
+                    egui::ComboBox::from_id_salt("agent_provider").selected_text(self.agent.provider.name()).show_ui(ui, |ui| {
+                        for p in [agent::Provider::Claude, agent::Provider::Codex] {
+                            if ui.selectable_label(self.agent.provider == p, p.name()).clicked() {
+                                switch_to = Some(p);
+                            }
+                        }
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("✕").on_hover_text("Close (Ctrl+Shift+A)").clicked() {
+                            close = true;
+                        }
+                        if ui.small_button("＋ New chat").clicked() {
+                            new_chat = true;
+                        }
+                    });
+                });
+                if cfg!(target_os = "android") {
+                    ui.add_space(8.0);
+                    ui.label("The agent needs the Claude Code or Codex command-line tool, which is not available on Android.");
+                    return;
+                }
+                match &self.agent.installed {
+                    None => {
+                        ui.small("Checking for the command-line tool…");
+                    }
+                    Some(None) => {
+                        ui.colored_label(c(theme.ansi[1]), format!("`{}` was not found on this PC.", self.agent.provider.bin()));
+                        ui.small(self.agent.provider.install_hint());
+                    }
+                    Some(Some(v)) => {
+                        ui.small(format!("{} · uses your own login · tools off (advice only)", v));
+                    }
+                }
+                let usable = matches!(self.agent.installed, Some(Some(_)));
+                // ---- context + quick actions
+                ui.horizontal_wrapped(|ui| {
+                    let in_term = matches!(self.tabs.get(self.active).map(|t| &t.kind), Some(TabKind::Term(_)));
+                    ui.add_enabled(in_term, egui::Checkbox::new(&mut self.agent.ctx_screen, "Include terminal screen"));
+                    if let Some(sel) = self.agent.selection.clone() {
+                        if ui.small_button(format!("📎 selection ({} chars) ✕", sel.chars().count())).clicked() {
+                            self.agent.selection = None;
+                        }
+                    }
+                });
+                if usable && self.agent.running.is_none() {
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, q) in [
+                            ("Explain screen", "Explain what is on my terminal screen in plain words."),
+                            ("What went wrong?", "Something failed in my terminal. What went wrong and how do I fix it?"),
+                            ("Next command?", "Based on my terminal, what command should I run next?"),
+                        ] {
+                            if ui.small_button(label).clicked() {
+                                send = Some(q.to_string());
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                // ---- input at the bottom, transcript fills the rest
+                egui::Panel::bottom("agent_input_panel").frame(egui::Frame::NONE).show_separator_line(false).show(ui, |ui| {
+                    let id = ui.make_persistent_id("agent_input");
+                    let had_focus = ui.memory(|m| m.has_focus(id));
+                    let enter = had_focus && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                    let te = ui.add(
+                        egui::TextEdit::multiline(&mut self.agent.input)
+                            .id(id)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Ask about this terminal…  Enter sends, Shift+Enter adds a line"),
+                    );
+                    if self.agent.focus_input {
+                        te.request_focus();
+                        self.agent.focus_input = false;
+                    }
+                    if enter && usable && self.agent.running.is_none() && !self.agent.input.trim().is_empty() {
+                        send = Some(std::mem::take(&mut self.agent.input));
+                        te.request_focus();
+                    }
+                    ui.horizontal(|ui| {
+                        if self.agent.running.is_some() {
+                            if ui.button("■ Stop").clicked() {
+                                stop = true;
+                            }
+                            ui.spinner();
+                        } else if ui.add_enabled(usable && !self.agent.input.trim().is_empty(), egui::Button::new("Send ⏎")).clicked() {
+                            send = Some(std::mem::take(&mut self.agent.input));
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                        if self.agent.msgs.is_empty() {
+                            ui.add_space(12.0);
+                            ui.label(RichText::new("Ask anything about what you're doing on the server.").weak());
+                            ui.label(RichText::new("The terminal screen (or text you select and right-click → Ask agent) is shared with the CLI; nothing else is.").weak().small());
+                        }
+                        let last = self.agent.msgs.len().saturating_sub(1);
+                        for (i, m) in self.agent.msgs.iter().enumerate() {
+                            if m.user {
+                                egui::Frame::new().fill(c(theme.selection).gamma_multiply(0.6)).corner_radius(8).inner_margin(8.0).show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.add(egui::Label::new(&m.text).selectable(true));
+                                    if !m.note.is_empty() {
+                                        ui.label(RichText::new(&m.note).small().weak());
+                                    }
+                                });
+                            } else if m.error {
+                                ui.colored_label(c(theme.ansi[1]), format!("⚠ {}", m.text));
+                            } else {
+                                let streaming = self.agent.running.is_some() && i == last;
+                                for (bi, b) in agent::parse_blocks(&m.text).iter().enumerate() {
+                                    match b {
+                                        agent::Block::Text(t) => render_markdown(ui, t, &theme, accent),
+                                        agent::Block::Code { lang, code } => {
+                                            egui::Frame::new().fill(mix_dark(&theme)).stroke(egui::Stroke::new(1.0, c(theme.selection))).corner_radius(6).inner_margin(8.0).show(ui, |ui| {
+                                                ui.set_width(ui.available_width());
+                                                if !lang.is_empty() {
+                                                    ui.label(RichText::new(lang).small().weak());
+                                                }
+                                                ui.add(egui::Label::new(RichText::new(code).monospace()).selectable(true));
+                                                if !streaming || bi + 1 < agent::parse_blocks(&m.text).len() {
+                                                    ui.horizontal(|ui| {
+                                                        if ui.small_button("⏎ Insert").on_hover_text("Type it at the prompt without pressing Enter").clicked() {
+                                                            to_term.push((code.clone(), false));
+                                                        }
+                                                        if ui.small_button("▶ Run").on_hover_text("Type it and press Enter in the active terminal").clicked() {
+                                                            to_term.push((code.clone(), true));
+                                                        }
+                                                        if ui.small_button("Copy").clicked() {
+                                                            ui.ctx().copy_text(code.clone());
+                                                        }
+                                                    });
+                                                }
+                                            });
+                                        }
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                            }
+                            ui.add_space(6.0);
+                        }
+                        if self.agent.running.is_some() && self.agent.msgs.last().map(|m| m.user).unwrap_or(true) {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(RichText::new("thinking…").weak());
+                            });
+                        }
+                    });
+            });
+        if let Some(p) = switch_to {
+            if p != self.agent.provider {
+                self.agent.provider = p;
+                self.agent.session = None;
+                self.agent.detect_started = false;
+                self.agent.installed = None;
+            }
+        }
+        if stop {
+            if let Some(r) = &self.agent.running {
+                r.stop();
+            }
+        }
+        if new_chat {
+            if let Some(r) = self.agent.running.take() {
+                r.stop();
+            }
+            self.agent.turn += 1;
+            self.agent.msgs.clear();
+            self.agent.session = None;
+        }
+        for (code, run) in to_term {
+            self.agent_to_terminal(&code, run);
+        }
+        if let Some(t) = send {
+            self.agent_send(t);
+        }
+        if close {
+            self.show_agent = false;
+        }
+    }
+
     /// Text currently on the active terminal's screen (for agent context).
     fn active_screen_text(&self) -> Option<String> {
         match self.tabs.get(self.active).map(|t| &t.kind) {
             Some(TabKind::Term(tt)) => Some(tt.term.parser.screen().contents()),
             _ => None,
-        }
-    }
-
-    fn agent_window(&mut self, ctx: &egui::Context) {
-        if !self.show_agent {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new("🤖 Agent").open(&mut open).default_size([520.0, 480.0]).show(ctx, |ui| {
-            ui.small("Runs your locally installed CLI using your own subscription login (run `claude` or `codex` once in a normal terminal to sign in). Nothing is sent anywhere by sshield itself.");
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("agent_kind").selected_text(["Claude Code", "Codex"][self.agent_kind as usize]).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.agent_kind, 0, "Claude Code (claude -p)");
-                    ui.selectable_value(&mut self.agent_kind, 1, "Codex (codex exec)");
-                });
-                ui.checkbox(&mut self.agent_ctx, "Include the active terminal screen");
-            });
-            ui.add(egui::TextEdit::multiline(&mut self.agent_prompt).hint_text("Ask about the output, an error, or a command…").desired_rows(3).desired_width(f32::INFINITY));
-            ui.horizontal(|ui| {
-                let can = !self.agent_busy && !self.agent_prompt.trim().is_empty();
-                if ui.add_enabled(can, egui::Button::new("Ask")).clicked() {
-                    let mut prompt = String::new();
-                    if self.agent_ctx {
-                        if let Some(t) = self.active_screen_text() {
-                            prompt.push_str("Terminal screen:\n```\n");
-                            prompt.push_str(t.trim_end());
-                            prompt.push_str("\n```\n\n");
-                        }
-                    }
-                    prompt.push_str("Answer concisely. Put any shell command in a fenced code block; do not run anything yourself.\n\n");
-                    prompt.push_str(self.agent_prompt.trim());
-                    self.agent_busy = true;
-                    self.agent_out.clear();
-                    let (tx, ctx2, kind) = (self.tx.clone(), self.ctx.clone(), self.agent_kind);
-                    self.rt.spawn_blocking(move || {
-                        let _ = tx.send(UiMsg::AgentDone(run_agent(kind, &prompt)));
-                        ctx2.request_repaint();
-                    });
-                }
-                if self.agent_busy {
-                    ui.spinner();
-                    ui.label("thinking…");
-                }
-            });
-            ui.separator();
-            if let Some(cmd) = first_code_block(&self.agent_out) {
-                ui.horizontal(|ui| {
-                    if ui.button("⏎ Insert command into terminal (not run)").on_hover_text("Types the command at the prompt; you press Enter yourself").clicked() {
-                        self.send_to_active(cmd.as_bytes());
-                    }
-                    if ui.button("Copy").clicked() {
-                        ctx.copy_text(cmd.clone());
-                    }
-                });
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add(egui::Label::new(&self.agent_out).selectable(true));
-            });
-        });
-        if !open {
-            self.show_agent = false;
         }
     }
 
@@ -2823,7 +3172,6 @@ impl App {
         self.snippets_window(ctx);
         self.palette_window(ctx);
         self.schedules_window(ctx);
-        self.agent_window(ctx);
         self.share_windows(ctx);
         self.settings_window(ctx);
         if let Some(id) = self.confirm_delete.clone() {
@@ -3875,6 +4223,97 @@ impl App {
     }
 }
 
+fn mix_dark(t: &Theme) -> egui::Color32 {
+    let b = c(t.bg);
+    let k = if t.dark { 0.0 } else { 255.0 };
+    let m = |x: u8| (x as f32 + (k - x as f32) * 0.3) as u8;
+    egui::Color32::from_rgb(m(b.r()), m(b.g()), m(b.b()))
+}
+
+/// Small markdown renderer for assistant prose: headings, bullets, `code` and **bold**.
+fn render_markdown(ui: &mut egui::Ui, text: &str, theme: &Theme, accent: egui::Color32) {
+    for line in text.lines() {
+        let t = line.trim_end();
+        if t.trim().is_empty() {
+            ui.add_space(4.0);
+            continue;
+        }
+        let (body, size, indent) = if let Some(h) = t
+            .strip_prefix("### ")
+            .or_else(|| t.strip_prefix("## "))
+            .or_else(|| t.strip_prefix("# "))
+        {
+            (h.to_string(), 15.0, false)
+        } else if let Some(b) = t
+            .trim_start()
+            .strip_prefix("- ")
+            .or_else(|| t.trim_start().strip_prefix("* "))
+        {
+            (format!("•  {b}"), 13.5, true)
+        } else {
+            (t.to_string(), 13.5, false)
+        };
+        let heading = t.starts_with('#');
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = ui.available_width() - if indent { 12.0 } else { 0.0 };
+        let base = if heading { accent } else { c(theme.fg) };
+        let mut code = false;
+        let mut bold = false;
+        let mut buf = String::new();
+        let flush = |job: &mut egui::text::LayoutJob, buf: &mut String, code: bool, bold: bool| {
+            if buf.is_empty() {
+                return;
+            }
+            let fmt = egui::TextFormat {
+                font_id: if code {
+                    egui::FontId::monospace(size - 1.0)
+                } else {
+                    egui::FontId::proportional(size)
+                },
+                color: if code {
+                    accent
+                } else if bold {
+                    c(theme.fg)
+                } else {
+                    base
+                },
+                background: if code {
+                    c(theme.selection).gamma_multiply(0.5)
+                } else {
+                    egui::Color32::TRANSPARENT
+                },
+                underline: egui::Stroke::NONE,
+                ..Default::default()
+            };
+            job.append(buf, 0.0, fmt);
+            buf.clear();
+        };
+        let chars: Vec<char> = body.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '`' {
+                flush(&mut job, &mut buf, code, bold);
+                code = !code;
+                i += 1;
+            } else if !code && chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
+                flush(&mut job, &mut buf, code, bold);
+                bold = !bold;
+                i += 2;
+            } else {
+                buf.push(chars[i]);
+                i += 1;
+            }
+        }
+        flush(&mut job, &mut buf, code, bold);
+        ui.horizontal_wrapped(|ui| {
+            if indent {
+                ui.add_space(12.0);
+            }
+            ui.add(egui::Label::new(job).selectable(true));
+        });
+    }
+}
+
 fn describe_forward(f: &PortForward, port: u16) -> String {
     match f.kind {
         ForwardKind::Local => format!(
@@ -4023,61 +4462,6 @@ fn host_grid(
         });
 }
 
-/// Run the local agent CLI non-interactively; the prompt goes via stdin.
-fn run_agent(kind: u8, prompt: &str) -> Result<String, String> {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let (bin, args): (&str, &[&str]) = if kind == 0 {
-        ("claude", &["-p"])
-    } else {
-        ("codex", &["exec", "-"])
-    };
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", bin]);
-        c
-    } else {
-        Command::new(bin)
-    };
-    let mut child = cmd
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not start `{bin}` ({e}). Install it and sign in first."))?;
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(prompt.as_bytes());
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if out.status.success() && !text.is_empty() {
-        Ok(text)
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        Err(format!(
-            "`{bin}` failed: {}{}",
-            err.trim(),
-            if text.is_empty() {
-                String::new()
-            } else {
-                format!("\n{text}")
-            }
-        ))
-    }
-}
-
-/// Body of the first ``` fenced block, if any.
-fn first_code_block(text: &str) -> Option<String> {
-    let start = text.find("```")?;
-    let rest = &text[start + 3..];
-    let nl = rest.find('\n')?;
-    let body = &rest[nl + 1..];
-    let end = body.find("```")?;
-    let code = body[..end].trim_end();
-    (!code.is_empty()).then(|| code.to_string())
-}
-
 /// Phone UI: the keys a touch keyboard lacks, plus a compose box that sends a whole line.
 fn mobile_keys_bar(ui: &mut egui::Ui, compose: &mut String, ctrl: &mut bool, out: &mut Vec<u8>) {
     let keys: [(&str, &[u8]); 9] = [
@@ -4158,15 +4542,6 @@ fn fuzzy(needle: &str, hay: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extracts_code_block() {
-        assert_eq!(
-            first_code_block("run:\n```bash\nls -la\n```\nok").as_deref(),
-            Some("ls -la")
-        );
-        assert_eq!(first_code_block("no code"), None);
-    }
 
     #[test]
     fn compose_box_bytes() {
