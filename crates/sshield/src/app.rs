@@ -358,6 +358,8 @@ pub struct App {
     show_snippets: bool,
     show_schedules: bool,
     show_agent: bool,
+    compose: String,
+    ctrl_armed: bool,
     show_join: bool,
     share_dialog: Option<u64>,
     share_server_in: String,
@@ -449,6 +451,8 @@ impl App {
             show_snippets: false,
             show_schedules: false,
             show_agent: false,
+            compose: String::new(),
+            ctrl_armed: false,
             show_join: false,
             share_dialog: None,
             share_server_in: String::new(),
@@ -1809,6 +1813,9 @@ impl App {
         let mut sftp_host: Option<Host> = None;
         let mut stop_fwd: Option<usize> = None;
         let mut share_dialog = false;
+        let mut mobile_bytes: Vec<u8> = vec![];
+        let mobile = cfg!(target_os = "android");
+        let (mut compose, mut ctrl_armed) = (std::mem::take(&mut self.compose), self.ctrl_armed);
         let mut zoom = 1.0f32;
         {
             let TabKind::Term(tt) = &mut self.tabs[idx].kind else {
@@ -1888,7 +1895,13 @@ impl App {
                                 }
                             });
                         });
-                    let out = tt.term.show(ui, &theme, &settings, true);
+                    if mobile {
+                        egui::Panel::bottom("mobile_keys").show(ui, |ui| {
+                            mobile_keys_bar(ui, &mut compose, &mut ctrl_armed, &mut mobile_bytes);
+                        });
+                    }
+                    let mut out = tt.term.show(ui, &theme, &settings, true);
+                    out.input.append(&mut mobile_bytes);
                     zoom = out.zoom;
                     if let Some(l) = out.submitted {
                         submitted = Some(l);
@@ -1919,6 +1932,8 @@ impl App {
         if broadcast && !input_out.is_empty() {
             self.send_to_all(&input_out);
         }
+        self.compose = compose;
+        self.ctrl_armed = ctrl_armed;
         if share_dialog {
             self.share_dialog = Some(self.tabs[idx].id);
             if self.share_server_in.is_empty() {
@@ -3783,6 +3798,68 @@ fn first_code_block(text: &str) -> Option<String> {
     (!code.is_empty()).then(|| code.to_string())
 }
 
+/// Phone UI: the keys a touch keyboard lacks, plus a compose box that sends a whole line.
+fn mobile_keys_bar(ui: &mut egui::Ui, compose: &mut String, ctrl: &mut bool, out: &mut Vec<u8>) {
+    let keys: [(&str, &[u8]); 9] = [
+        ("Esc", b"\x1b"),
+        ("Tab", b"\t"),
+        ("↑", b"\x1b[A"),
+        ("↓", b"\x1b[B"),
+        ("←", b"\x1b[D"),
+        ("→", b"\x1b[C"),
+        ("^C", b"\x03"),
+        ("^D", b"\x04"),
+        ("^Z", b"\x1a"),
+    ];
+    egui::ScrollArea::horizontal()
+        .id_salt("mkeys")
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.toggle_value(ctrl, "Ctrl");
+                for (label, bytes) in keys {
+                    if ui.button(label).clicked() {
+                        out.extend_from_slice(bytes);
+                    }
+                }
+                for ch in ["/", "-", "|", "~", "_", ":", "*"] {
+                    if ui.button(ch).clicked() {
+                        out.extend_from_slice(ch.as_bytes());
+                    }
+                }
+            });
+        });
+    ui.horizontal(|ui| {
+        let r = ui.add(
+            egui::TextEdit::singleline(compose)
+                .hint_text("type here, Enter to send")
+                .desired_width(ui.available_width() - 70.0),
+        );
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.button("Send ⏎").clicked() || enter {
+            out.extend_from_slice(&compose_to_bytes(compose, *ctrl));
+            compose.clear();
+            *ctrl = false;
+            r.request_focus();
+        }
+    });
+}
+
+/// Compose-box text -> bytes. With Ctrl armed, a single letter becomes a control character
+/// (no Enter appended); otherwise the text is followed by Enter.
+fn compose_to_bytes(text: &str, ctrl: bool) -> Vec<u8> {
+    if ctrl {
+        let mut it = text.chars();
+        if let (Some(c), None) = (it.next(), it.next()) {
+            if c.is_ascii_alphabetic() {
+                return vec![c.to_ascii_lowercase() as u8 - b'a' + 1];
+            }
+        }
+    }
+    let mut v = text.as_bytes().to_vec();
+    v.push(b'\r');
+    v
+}
+
 fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     if s >= 3600 {
@@ -3809,6 +3886,13 @@ mod tests {
             Some("ls -la")
         );
         assert_eq!(first_code_block("no code"), None);
+    }
+
+    #[test]
+    fn compose_box_bytes() {
+        assert_eq!(compose_to_bytes("ls -la", false), b"ls -la\r");
+        assert_eq!(compose_to_bytes("c", true), vec![3]);
+        assert_eq!(compose_to_bytes("ls", true), b"ls\r");
     }
 
     #[test]

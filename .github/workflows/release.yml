@@ -61,9 +61,44 @@ jobs:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
 
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked
+      - name: Debug keystore (beta builds are sideload-only)
+        run: |
+          mkdir -p ~/.android
+          keytool -genkeypair -keystore ~/.android/debug.keystore -storepass android -keypass android \
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+      - name: Use the tag as the app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          sed -i.bak -E "0,/^version = \".*\"/s//version = \"$v\"/" Cargo.toml
+          grep -n '^version' Cargo.toml
+      - name: Build APK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME NDK=$ANDROID_NDK_HOME"
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          cargo apk build --release -p sshield --lib
+          cp target/release/apk/sshield.apk sshield-android-beta.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sshield-android-beta.apk
+          path: sshield-android-beta.apk
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, android]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
