@@ -16,9 +16,79 @@ async function sha256hex(s) {
 const json = (obj, status = 200, extra = {}) =>
   new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json", ...extra } });
 
+// ---- Shared terminal sessions -------------------------------------------------
+// One Durable Object per room. The relay forwards opaque, end-to-end encrypted frames:
+//   host -> every guest, guest -> host. Clients encrypt with a key that never leaves the
+//   share link's fragment, so the relay learns nothing about the terminal contents.
+//   GET /v1/room/<32 hex>?role=host&hs=<host secret>   (WebSocket)
+//   GET /v1/room/<32 hex>?role=guest                    (WebSocket)
+const MAX_GUESTS = 8;
+const MAX_FRAME = 256 * 1024;
+
+export class Room {
+  constructor(state) {
+    this.state = state;
+  }
+
+  guestCount() {
+    return this.state.getWebSockets("guest").length;
+  }
+
+  notifyHost() {
+    for (const h of this.state.getWebSockets("host")) h.send(JSON.stringify({ t: "guests", n: this.guestCount() }));
+  }
+
+  async fetch(request) {
+    if (request.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
+    const url = new URL(request.url);
+    const role = url.searchParams.get("role");
+    if (role === "host") {
+      const hs = url.searchParams.get("hs") || "";
+      if (!/^[0-9a-f]{32,128}$/.test(hs)) return new Response("bad host secret", { status: 400 });
+      const stored = await this.state.storage.get("hs");
+      if (stored === undefined) await this.state.storage.put("hs", hs);
+      else if (stored !== hs) return new Response("forbidden", { status: 403 });
+      for (const old of this.state.getWebSockets("host")) old.close(1000, "replaced");
+    } else if (role === "guest") {
+      if ((await this.state.storage.get("hs")) === undefined) return new Response("no such session", { status: 404 });
+      if (this.state.getWebSockets("host").length === 0) return new Response("host is not online", { status: 404 });
+      if (this.guestCount() >= MAX_GUESTS) return new Response("room full", { status: 429 });
+    } else {
+      return new Response("bad role", { status: 400 });
+    }
+    const pair = new WebSocketPair();
+    this.state.acceptWebSocket(pair[1], [role]);
+    this.notifyHost();
+    return new Response(null, { status: 101, webSocket: pair[0] });
+  }
+
+  webSocketMessage(ws, msg) {
+    const size = typeof msg === "string" ? msg.length : msg.byteLength;
+    if (size > MAX_FRAME || typeof msg === "string") return;
+    const isHost = this.state.getTags(ws).includes("host");
+    for (const peer of this.state.getWebSockets(isHost ? "guest" : "host")) peer.send(msg);
+  }
+
+  webSocketClose(ws) {
+    const wasHost = this.state.getTags(ws).includes("host");
+    if (wasHost && this.state.getWebSockets("host").filter((w) => w !== ws).length === 0) {
+      for (const g of this.state.getWebSockets("guest")) g.close(1000, "host ended the session");
+      this.state.storage.deleteAll();
+    } else {
+      this.notifyHost();
+    }
+  }
+
+  webSocketError(ws) {
+    ws.close(1011, "error");
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const room = url.pathname.match(/^\/v1\/room\/([0-9a-f]{32})$/);
+    if (room) return env.ROOMS.get(env.ROOMS.idFromName(room[1])).fetch(request);
     if (url.pathname !== "/v1/vault") {
       return url.pathname === "/" ? new Response("sshield sync server\n") : json({ error: "not found" }, 404);
     }

@@ -14,6 +14,7 @@ pub mod export;
 pub mod forward;
 pub mod model;
 pub mod sftp;
+pub mod share;
 pub mod ssh;
 pub mod sshconfig;
 pub mod sync;

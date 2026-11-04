@@ -23,6 +23,7 @@ tokio = { version = "1.54.1", features = ["full"] }
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 toml = "1.1.8"
 zeroize = "1.9.1"
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tokio-test = "0.4.6"

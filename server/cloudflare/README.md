@@ -28,3 +28,17 @@ name, and press **Upload this vault**. On another device: unlock/create nothing 
 - Changing the master password re-keys the vault: push from that device, then re-download elsewhere.
 - Anyone who learns your account name can try guessing your password offline against the stored blob
   (same as for any cloud-stored password vault) — use a strong master password.
+
+## Shared terminal sessions
+
+The same Worker relays live shared terminals through a Durable Object (one per session; the
+free plan supports SQLite-backed Durable Objects). In sshield click **🔗 Share** on a terminal tab,
+send the link, and the other person pastes it under **🔗 Join**.
+
+- Frames are end-to-end encrypted (XChaCha20-Poly1305). The key lives only in the link; the relay
+  forwards ciphertext and never sees terminal contents.
+- Viewers are read-only until the host ticks *Allow viewers to type*; the host can stop any time.
+- Anyone holding the link can watch, so treat it like a password. Up to 8 viewers per session.
+- Redeploy after pulling updates: `npx wrangler deploy` (the `[[migrations]]` block creates the class).
+- Local test: `npx wrangler dev --local --port 8799`, then
+  `SSHIELD_RELAY=http://localhost:8799 cargo test -p sshield-core --test relay`.
