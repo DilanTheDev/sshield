@@ -2,8 +2,14 @@ name: sshield
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# a newer push to the same branch/PR cancels the older run instead of queueing behind it
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
