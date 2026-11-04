@@ -48,7 +48,7 @@ name = "android.permission.INTERNET"
 
 # Beta builds are signed with the standard Android debug key (sideloading only, not Play Store).
 [package.metadata.android.signing.release]
-path = "$HOME/.android/debug.keystore"
+path = "debug.keystore"
 keystore_password = "android"
 
 [package.metadata.android.application]
