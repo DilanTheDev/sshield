@@ -1,0 +1,4 @@
+{"type": "system", "subtype": "init", "session_id": "00000000-0000-4000-8000-000000000000"}
+{"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hello world"}}}
+{"type": "assistant", "message": {"content": [{"type": "text", "text": "hello world"}]}}
+{"type": "result", "subtype": "success", "is_error": false, "result": "hello world", "session_id": "00000000-0000-4000-8000-000000000000"}

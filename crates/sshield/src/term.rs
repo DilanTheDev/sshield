@@ -17,6 +17,7 @@ impl Default for TermOutput {
             submitted: None,
             clicked: false,
             zoom: 1.0,
+            ask_agent: None,
         }
     }
 }
@@ -31,6 +32,8 @@ pub struct TermOutput {
     pub clicked: bool,
     /// Multiplicative font zoom requested via Ctrl+scroll (1.0 = none).
     pub zoom: f32,
+    /// Text the user asked to send to the agent (right-click → Ask agent).
+    pub ask_agent: Option<String>,
 }
 
 pub struct TermView {
@@ -72,7 +75,7 @@ impl TermView {
         (self.cols, self.rows)
     }
 
-    fn selection_text(&self) -> Option<String> {
+    pub(crate) fn selection_text(&self) -> Option<String> {
         let (a, b) = self.sel?;
         let (s, e) = if a <= b { (a, b) } else { (b, a) };
         let t = self
@@ -184,6 +187,17 @@ impl TermView {
                 if let Some(t) = self.selection_text() {
                     ui.ctx().copy_text(t);
                 }
+                ui.close();
+            }
+            let sel = self.selection_text();
+            if ui
+                .add_enabled(
+                    sel.is_some(),
+                    egui::Button::new("🤖 Ask agent about selection"),
+                )
+                .clicked()
+            {
+                out.ask_agent = sel;
                 ui.close();
             }
             if ui.button("Clear selection").clicked() {

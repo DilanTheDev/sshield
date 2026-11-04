@@ -1,5 +1,6 @@
 //! sshield - a fast, free, native SSH client (desktop binary + Android library).
 
+mod agent;
 mod app;
 mod sftp_view;
 mod term;
