@@ -142,7 +142,20 @@ impl TermView {
                 .clamp(0.0, (rows - 1) as f32) as u16;
             (y, x)
         };
-        if let Some(p) = resp.interact_pointer_pos() {
+        // Touch screens: dragging scrolls the scrollback (selection is via double-tap on a word).
+        let touch = cfg!(target_os = "android");
+        if touch && resp.dragged() {
+            self.scroll_accum += resp.drag_delta().y / ch;
+            let lines = self.scroll_accum.trunc() as i32;
+            if lines != 0 {
+                self.scroll_accum -= lines as f32;
+                let cur = self.parser.screen().scrollback() as i32;
+                self.parser
+                    .screen_mut()
+                    .set_scrollback((cur + lines).max(0) as usize);
+            }
+        }
+        if let Some(p) = resp.interact_pointer_pos().filter(|_| !touch) {
             if resp.drag_started() {
                 self.anchor = Some(cell_at(p));
                 self.sel = None;
@@ -585,11 +598,7 @@ impl TermView {
             } if (key == Key::V && modifiers.ctrl && modifiers.shift)
                 || (key == Key::Insert && modifiers.shift && !modifiers.ctrl) =>
             {
-                if let Some(t) = arboard::Clipboard::new()
-                    .and_then(|mut cb| cb.get_text())
-                    .ok()
-                    .filter(|t| !t.is_empty())
-                {
+                if let Some(t) = clipboard_text() {
                     self.handle_event(Event::Paste(t), out, ctx);
                 }
             }
@@ -748,6 +757,21 @@ impl TermView {
         };
         out.input.extend_from_slice(&bytes);
     }
+}
+
+/// System clipboard text (desktop). Android has no equivalent here; the on-screen input bar
+/// uses the keyboard's own paste instead.
+#[cfg(not(target_os = "android"))]
+fn clipboard_text() -> Option<String> {
+    arboard::Clipboard::new()
+        .and_then(|mut cb| cb.get_text())
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+#[cfg(target_os = "android")]
+fn clipboard_text() -> Option<String> {
+    None
 }
 
 fn key_char(k: Key, shift: bool) -> Option<char> {

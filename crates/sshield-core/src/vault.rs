@@ -311,8 +311,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+static DATA_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Platforms without a conventional per-user data dir (Android) set it once at startup.
+pub fn set_data_dir(path: PathBuf) {
+    let _ = DATA_DIR_OVERRIDE.set(path);
+}
+
 /// Default location of the app's data directory.
 pub fn data_dir() -> PathBuf {
+    if let Some(p) = DATA_DIR_OVERRIDE.get() {
+        return p.clone();
+    }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("sshield")
