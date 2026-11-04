@@ -29,5 +29,5 @@ Set by the repo owner (DilanTheDev). Follow these without asking again.
 
 ## Sync / sharing server
 - The optional sync + shared-terminal relay is the Cloudflare Worker in `server/cloudflare`,
-  deployed as `sshield-sync` on the owner's dilankaul@gmail.com Cloudflare account
+  deployed as `sshield-sync` on the owner's Cloudflare account
   (https://sshield-sync.dilankaul.workers.dev). Redeploy it after changing `worker.js`.
