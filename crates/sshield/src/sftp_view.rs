@@ -241,13 +241,13 @@ impl SftpTab {
             // ---------------- local
             cols[0].heading("Local");
             cols[0].horizontal(|ui| {
-                if ui.button("⬆").on_hover_text("Parent directory").clicked() {
+                if ui.button("Up").on_hover_text("Parent directory").clicked() {
                     if let Some(p) = self.local_cwd.parent() {
                         let p = p.to_path_buf();
                         self.cd_local(p);
                     }
                 }
-                if ui.button("🏠").clicked() {
+                if ui.button("Home").clicked() {
                     self.cd_local(dirs_home());
                 }
                 let r = ui.add(
@@ -289,14 +289,14 @@ impl SftpTab {
             cols[1].heading("Remote");
             cols[1].horizontal(|ui| {
                 if ui
-                    .add_enabled(can_act, egui::Button::new("⬆"))
+                    .add_enabled(can_act, egui::Button::new("Up"))
                     .on_hover_text("Parent directory")
                     .clicked()
                 {
                     let p = sftp::parent(&self.remote_cwd);
                     self.cd_remote(p);
                 }
-                if ui.add_enabled(can_act, egui::Button::new("⟳")).clicked() {
+                if ui.add_enabled(can_act, egui::Button::new("Refresh")).clicked() {
                     self.refresh_remote();
                 }
                 let r = ui.add(
@@ -464,7 +464,7 @@ impl SftpTab {
             } else if ui
                 .add_enabled(
                     can_act && remote_sel.is_some(),
-                    egui::Button::new("🗑 Delete"),
+                    egui::Button::new("Delete"),
                 )
                 .clicked()
             {

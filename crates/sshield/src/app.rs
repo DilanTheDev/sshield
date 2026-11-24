@@ -996,7 +996,7 @@ impl App {
                 )
             };
             if connector.vpn_policy.is_some() {
-                t.via.push_str(" · 🛡 VPN-pinned");
+                t.via.push_str(" · VPN-pinned");
             }
         }
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
@@ -1489,7 +1489,7 @@ impl App {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.22);
-                ui.heading(RichText::new("🛡 sshield").size(34.0));
+                ui.heading(RichText::new("sshield").size(34.0));
                 ui.label("A fast, free, native SSH client. Everything is encrypted with your master password.");
                 ui.add_space(18.0);
                 let mut submit = false;
@@ -1536,7 +1536,7 @@ impl App {
                         ui.add(egui::TextEdit::singleline(&mut self.sync_acct_in).hint_text("Sync account name").desired_width(340.0));
                         ui.small("Uses the master password typed above. The vault is decrypted only on this device.");
                         let ok = !self.unlocking && !self.pw.is_empty() && !self.sync_url_in.trim().is_empty() && !self.sync_acct_in.trim().is_empty();
-                        if ui.add_enabled(ok, egui::Button::new("⬇ Download & unlock")).clicked() {
+                        if ui.add_enabled(ok, egui::Button::new("Download and unlock")).clicked() {
                             self.sync_download_new_device();
                         }
                     });
@@ -1631,7 +1631,7 @@ impl App {
     fn vpn_chip(&mut self, ui: &mut egui::Ui) {
         let p = &self.lib.settings.vpn;
         if !p.enabled {
-            ui.label(RichText::new("🛡 VPN off").weak()).on_hover_text(
+            ui.label(RichText::new("VPN off").weak()).on_hover_text(
                 "SSH traffic is not forced through a VPN. Enable in Settings → VPN.",
             );
             return;
@@ -1643,8 +1643,8 @@ impl App {
         ui.ctx().request_repaint_after(Duration::from_secs(2));
         let iface = vpn::expected_interface(p).unwrap_or_else(|| "?".into());
         match self.vpn_status.1 {
-            Some(true) => ui.label(RichText::new(format!("🛡 VPN {iface} ●")).color(c(self.theme.ansi[2]))).on_hover_text("Tunnel is up. SSH is pinned to this interface and blocked otherwise."),
-            _ => ui.label(RichText::new(format!("🛡 VPN {iface} ○")).color(c(self.theme.ansi[1]))).on_hover_text(if p.auto_start {
+            Some(true) => ui.label(RichText::new(format!("VPN {iface} ●")).color(c(self.theme.ansi[2]))).on_hover_text("Tunnel is up. SSH is pinned to this interface and blocked otherwise."),
+            _ => ui.label(RichText::new(format!("VPN {iface} ○")).color(c(self.theme.ansi[1]))).on_hover_text(if p.auto_start {
                 "Tunnel is down. It will be started on connect; SSH never falls back to a direct connection."
             } else {
                 "Tunnel is down. SSH connections are BLOCKED until it is up."
@@ -1719,28 +1719,28 @@ impl App {
                         self.close_tab(i);
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("🔒").on_hover_text("Lock vault").clicked() {
+                        if ui.button("Lock").on_hover_text("Lock vault").clicked() {
                             self.lock();
                         }
-                        if ui.button("⚙").on_hover_text("Settings").clicked() {
+                        if ui.button("Settings").clicked() {
                             self.show_settings = !self.show_settings;
                         }
                         if ui
-                            .button("🤖 Agent")
+                            .button("Agent")
                             .on_hover_text("Chat with your local Claude Code / Codex CLI")
                             .clicked()
                         {
                             self.show_agent = !self.show_agent;
                         }
-                        if ui.button("⏰ Schedules").clicked() {
+                        if ui.button("Schedules").clicked() {
                             self.show_schedules = !self.show_schedules;
                         }
                         if ui.button("{ } Snippets").clicked() {
                             self.show_snippets = !self.show_snippets;
                         }
                         if ui
-                            .button("⌕ Ctrl+K")
-                            .on_hover_text("Command palette")
+                            .button("Connect (Ctrl+K)")
+                            .on_hover_text("Jump to a saved host")
                             .clicked()
                         {
                             self.palette = Some(String::new());
@@ -1751,7 +1751,7 @@ impl App {
                             .filter(|t| matches!(&t.kind, TabKind::Term(tt) if tt.tx.is_some()))
                             .count();
                         if terms > 1 {
-                            ui.toggle_value(&mut self.broadcast, "📡 Broadcast")
+                            ui.toggle_value(&mut self.broadcast, "Broadcast")
                                 .on_hover_text("Type once, send to ALL open terminals");
                         } else {
                             self.broadcast = false;
@@ -1782,7 +1782,7 @@ impl App {
                                 ui.small(&tt.via);
                             }
                             if !tt.forwards.is_empty() {
-                                ui.small(format!("⇄ {} forwards", tt.forwards.len()));
+                                ui.small(format!("{} forwards", tt.forwards.len()));
                             }
                             ui.small(format!("{cols}×{rows}"));
                             if matches!(tt.state, TermState::Ready) {
@@ -1804,9 +1804,9 @@ impl App {
                             let label = if self.installing {
                                 "Updating…".to_string()
                             } else if cfg!(windows) && rel.installer_url.is_some() {
-                                format!("⬆ Update to v{} — install & restart", rel.version)
+                                format!("Install v{} and restart", rel.version)
                             } else {
-                                format!("⬆ v{} available — open download", rel.version)
+                                format!("Download v{}", rel.version)
                             };
                             if ui
                                 .add_enabled(
@@ -1909,7 +1909,7 @@ impl App {
                     egui::Panel::bottom("closed_bar").show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.colored_label(c(theme.ansi[3]), &msg);
-                            if ui.button("↻ Reconnect").clicked() {
+                            if ui.button("Reconnect").clicked() {
                                 reconnect = true;
                             }
                         });
@@ -1926,7 +1926,7 @@ impl App {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 if ui
-                                    .small_button("📁 SFTP")
+                                    .small_button("SFTP")
                                     .on_hover_text("Open file browser on this connection")
                                     .clicked()
                                 {
@@ -1936,10 +1936,10 @@ impl App {
                                 if let Some(sh) = &tt.share {
                                 ui.colored_label(c(theme.ansi[1]), format!("● SHARING · {} viewer(s){}{}", sh.guests, if sh.allow_input { " · input ON" } else { "" }, if sh.rejected > 0 { format!(" · ⚠ {} replayed frame(s) blocked", sh.rejected) } else { String::new() }));
                             }
-                            if ui.small_button(if tt.share.is_some() { "🔗 Sharing…" } else { "🔗 Share" }).on_hover_text("Let another sshield user watch (and, if you allow, type in) this terminal").clicked() {
+                            if ui.small_button(if tt.share.is_some() { "Sharing…" } else { "Share" }).on_hover_text("Let another sshield user watch (and, if you allow, type in) this terminal").clicked() {
                                 share_dialog = true;
                             }
-                            if ui.small_button("⌫ Clear").clicked() {
+                            if ui.small_button("Clear").clicked() {
                                     tt.term.feed(b"\x1b[2J\x1b[3J\x1b[H");
                                 }
                                 for (i, f) in tt.forwards.iter().enumerate() {
@@ -1957,7 +1957,7 @@ impl App {
                                     let n =
                                         f.connections.load(std::sync::atomic::Ordering::Relaxed);
                                     if ui
-                                        .small_button(format!("⇄ {label} ({n}) ✕"))
+                                        .small_button(format!("{label} ({n}) ✕"))
                                         .on_hover_text("Click to stop this forward")
                                         .clicked()
                                     {
@@ -2215,7 +2215,7 @@ impl App {
             note: if note.is_empty() {
                 String::new()
             } else {
-                format!("📎 {}", note.join(" + "))
+                format!("Attached: {}", note.join(" + "))
             },
         });
         self.agent.turn += 1;
@@ -2300,7 +2300,7 @@ impl App {
             .show(ui, |ui| {
                 // ---- header
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("🤖 Agent").strong().size(16.0));
+                    ui.label(RichText::new("Agent").strong().size(16.0));
                     egui::ComboBox::from_id_salt("agent_provider").selected_text(self.agent.provider.name()).show_ui(ui, |ui| {
                         for p in [agent::Provider::Claude, agent::Provider::Codex] {
                             if ui.selectable_label(self.agent.provider == p, p.name()).clicked() {
@@ -2312,7 +2312,7 @@ impl App {
                         if ui.small_button("✕").on_hover_text("Close (Ctrl+Shift+A)").clicked() {
                             close = true;
                         }
-                        if ui.small_button("＋ New chat").clicked() {
+                        if ui.small_button("New chat").clicked() {
                             new_chat = true;
                         }
                     });
@@ -2340,7 +2340,7 @@ impl App {
                     let in_term = matches!(self.tabs.get(self.active).map(|t| &t.kind), Some(TabKind::Term(_)));
                     ui.add_enabled(in_term, egui::Checkbox::new(&mut self.agent.ctx_screen, "Include terminal screen"));
                     if let Some(sel) = self.agent.selection.clone() {
-                        if ui.small_button(format!("📎 selection ({} chars) ✕", sel.chars().count())).clicked() {
+                        if ui.small_button(format!("Selection ({} chars) ✕", sel.chars().count())).clicked() {
                             self.agent.selection = None;
                         }
                     }
@@ -2381,11 +2381,11 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         if self.agent.running.is_some() {
-                            if ui.button("■ Stop").clicked() {
+                            if ui.button("Stop").clicked() {
                                 stop = true;
                             }
                             ui.spinner();
-                        } else if ui.add_enabled(usable && !self.agent.input.trim().is_empty(), egui::Button::new("Send ⏎")).clicked() {
+                        } else if ui.add_enabled(usable && !self.agent.input.trim().is_empty(), egui::Button::new("Send")).clicked() {
                             send = Some(std::mem::take(&mut self.agent.input));
                         }
                     });
@@ -2423,10 +2423,10 @@ impl App {
                                                 ui.add(egui::Label::new(RichText::new(code).monospace()).selectable(true));
                                                 if !streaming || bi + 1 < agent::parse_blocks(&m.text).len() {
                                                     ui.horizontal(|ui| {
-                                                        if ui.small_button("⏎ Insert").on_hover_text("Type it at the prompt without pressing Enter").clicked() {
+                                                        if ui.small_button("Insert").on_hover_text("Type it at the prompt without pressing Enter").clicked() {
                                                             to_term.push((code.clone(), false));
                                                         }
-                                                        if ui.small_button("▶ Run").on_hover_text("Type it and press Enter in the active terminal").clicked() {
+                                                        if ui.small_button("Run").on_hover_text("Type it and press Enter in the active terminal").clicked() {
                                                             to_term.push((code.clone(), true));
                                                         }
                                                         if ui.small_button("Copy").clicked() {
@@ -2554,10 +2554,10 @@ impl App {
                     ),
                     _ => None,
                 });
-            egui::Window::new("🔗 Share this terminal").open(&mut open).default_width(480.0).show(ctx, |ui| {
+            egui::Window::new("Share this terminal").open(&mut open).default_width(480.0).show(ctx, |ui| {
                 match &info {
                     Some(Some((link, guests, allow_input))) => {
-                        ui.label("Send this link to the other person (they paste it under 🔗 Join). Anyone who has it can watch, so share it privately.");
+                        ui.label("Send this link to the other person (they paste it under Join). Anyone who has it can watch, so share it privately.");
                         let mut l = link.clone();
                         ui.add(egui::TextEdit::singleline(&mut l).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
                         if ui.button("Copy link").clicked() {
@@ -2630,7 +2630,7 @@ impl App {
         // ---- guest: join with a link
         if self.show_join {
             let mut open = true;
-            egui::Window::new("🔗 Join a shared terminal")
+            egui::Window::new("Join a shared terminal")
                 .open(&mut open)
                 .default_width(480.0)
                 .show(ctx, |ui| {
@@ -2801,13 +2801,13 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(8, 12)),
             )
             .show(ui, |ui| {
-                ui.label(RichText::new("🛡 sshield").strong().size(16.0));
+                ui.label(RichText::new("sshield").strong().size(16.0));
                 ui.add_space(10.0);
                 let items = [
-                    ("🖥  Hosts", HomeView::Hosts),
-                    ("🔑  Keychain", HomeView::Keychain),
-                    ("🕘  History", HomeView::History),
-                    ("⇄  Tunnels", HomeView::Tunnels),
+                    ("Hosts", HomeView::Hosts),
+                    ("Keychain", HomeView::Keychain),
+                    ("History", HomeView::History),
+                    ("Tunnels", HomeView::Tunnels),
                 ];
                 for (label, view) in items {
                     let sel = self.home_view == view;
@@ -2830,9 +2830,9 @@ impl App {
                 ui.add_space(6.0);
                 for (label, which) in [
                     ("{ }  Snippets", 0),
-                    ("⏰  Schedules", 1),
-                    ("🤖  Agent", 2),
-                    ("⚙  Settings", 3),
+                    ("Schedules", 1),
+                    ("Agent", 2),
+                    ("Settings", 3),
                 ] {
                     let r = ui.add_sized(
                         [ui.available_width(), 30.0],
@@ -2868,7 +2868,7 @@ impl App {
         ui.heading("Command history");
         ui.add(
             egui::TextEdit::singleline(&mut self.history_q)
-                .hint_text("🔍 Filter history…")
+                .hint_text("Filter history…")
                 .desired_width(360.0),
         );
         let q = self.history_q.to_lowercase();
@@ -2898,7 +2898,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.add(egui::Label::new(RichText::new(cmd).monospace()).truncate());
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("🗑").on_hover_text("Delete").clicked() {
+                            if ui.small_button("Delete").clicked() {
                                 delete = Some(*i);
                             }
                             if ui
@@ -3010,7 +3010,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("🔍 Search hosts, tags, groups…")
+                    .hint_text("Search hosts, tags, groups…")
                     .desired_width(280.0),
             );
             let r = ui.add(
@@ -3021,7 +3021,7 @@ impl App {
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.quick_connect();
             }
-            if ui.button(RichText::new("＋ New host").strong()).clicked() {
+            if ui.button(RichText::new("New host").strong()).clicked() {
                 let mut h = Host::new(
                     "",
                     "",
@@ -3032,7 +3032,7 @@ impl App {
                 h.group = String::new();
                 self.editor = Some(HostEditor::new(h, true));
             }
-            ui.menu_button("⬇ Export hosts", |ui| {
+            ui.menu_button("Export hosts", |ui| {
                 ui.small("Passwords and passphrases are never exported.");
                 if ui.button("JSON (re-importable backup)").clicked() {
                     self.export_hosts("json", export::hosts_json(&self.lib));
@@ -3526,7 +3526,7 @@ impl App {
                     if let Some(i) = remove {
                         ed.host.forwards.remove(i);
                     }
-                    if ui.button("＋ Add forward").clicked() {
+                    if ui.button("Add forward").clicked() {
                         ed.host.forwards.push(PortForward {
                             kind: ForwardKind::Local,
                             bind_host: "127.0.0.1".into(),
@@ -3584,7 +3584,7 @@ impl App {
                         ui.label(RichText::new(&s.name).strong());
                         ui.label(RichText::new(&s.command).monospace().weak());
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.small_button("🗑").clicked() {
+                            if ui.small_button("Delete").clicked() {
                                 delete = Some(s.id.clone());
                             }
                             if ui.small_button("All").clicked() {
@@ -3678,7 +3678,7 @@ impl App {
                 );
                 r.request_focus();
                 for (i, h) in hosts.iter().enumerate() {
-                    let label = format!("🖥  {}   {}@{}", h.label, h.username, h.hostname);
+                    let label = format!("{}   {}@{}", h.label, h.username, h.hostname);
                     if ui.selectable_label(i == 0, label).clicked() {
                         choose = Some((*h).clone());
                     }
@@ -3721,8 +3721,8 @@ impl App {
             ui.horizontal(|ui| {
                 for (t, n) in [
                     (SettingsTab::General, "General"),
-                    (SettingsTab::Vpn, "🛡 VPN"),
-                    (SettingsTab::Keys, "🔑 Keys"),
+                    (SettingsTab::Vpn, "VPN"),
+                    (SettingsTab::Keys, "Keys"),
                     (SettingsTab::Security, "Security & Sync"),
                     (SettingsTab::Highlights, "Highlights"),
                     (SettingsTab::About, "About"),
@@ -3899,7 +3899,7 @@ impl App {
                             vpn::verify_route(&b, ip, true)
                                 .await
                                 .map_err(|e| e.to_string())?;
-                            s.push_str(&format!("; {ip} is routed through it ✔"));
+                            s.push_str(&format!("; {ip} is routed through it"));
                         }
                         Ok::<_, String>(s)
                     }
@@ -3923,13 +3923,13 @@ impl App {
                 if ui
                     .selectable_label(
                         self.sel_identity.as_ref() == Some(&i.id),
-                        format!("🔑 {}", i.name),
+                        i.name.clone(),
                     )
                     .clicked()
                 {
                     self.sel_identity = Some(i.id.clone());
                 }
-                if ui.small_button("🗑").clicked() {
+                if ui.small_button("Delete").clicked() {
                     delete = Some(i.id.clone());
                 }
             });
@@ -4103,7 +4103,7 @@ impl App {
             }
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!self.sync_busy, egui::Button::new("↻ Sync now"))
+                    .add_enabled(!self.sync_busy, egui::Button::new("Sync now"))
                     .clicked()
                 {
                     self.sync_run(SyncMode::Auto);
@@ -4417,13 +4417,13 @@ fn host_grid(
                                     );
                                 }
                                 if h.jump.is_some() {
-                                    ui.small("↪ jump");
+                                    ui.small("jump");
                                 }
                                 if h.require_vpn == Some(true) {
-                                    ui.small("🛡 vpn");
+                                    ui.small("vpn");
                                 }
                                 if !h.forwards.is_empty() {
-                                    ui.small(format!("⇄ {}", h.forwards.len()));
+                                    ui.small(format!("{} fwd", h.forwards.len()));
                                 }
                             });
                         }
@@ -4448,7 +4448,7 @@ fn host_grid(
                             {
                                 actions.push(Action::Duplicate(h.id.clone()));
                             }
-                            if ui.button("🗑").on_hover_text("Delete").clicked() {
+                            if ui.button("Delete").clicked() {
                                 actions.push(Action::Delete(h.id.clone()));
                             }
                         });
@@ -4499,7 +4499,7 @@ fn mobile_keys_bar(ui: &mut egui::Ui, compose: &mut String, ctrl: &mut bool, out
                 .desired_width(ui.available_width() - 70.0),
         );
         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if ui.button("Send ⏎").clicked() || enter {
+        if ui.button("Send").clicked() || enter {
             out.extend_from_slice(&compose_to_bytes(compose, *ctrl));
             compose.clear();
             *ctrl = false;
