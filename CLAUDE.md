@@ -6,6 +6,8 @@ Set by the repo owner (DilanTheDev). Follow these without asking again.
 - Merge PRs yourself (squash) once CI is green and there are no open review threads. Do not ask first;
   tell the owner afterwards. Never merge with failing checks. If something looks wrong
   (unexpected files, security concern, red CI), stop and tell the owner instead.
+- This is the owner's standing go-ahead to merge. Never ask the owner whether to merge or to
+  confirm a merge; just merge when the conditions above hold.
 
 ## Releases
 - Releases are published from the owner's PC with Claude in Chrome, driven by a session started on
